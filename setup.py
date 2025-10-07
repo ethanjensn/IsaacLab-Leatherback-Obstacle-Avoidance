@@ -10,12 +10,12 @@ setup(
         "gymnasium>=0.29.0",
         # Add other direct dependencies if any
     ],
-    author="Your Name", # Replace with your name
-    author_email="your.email@example.com", # Replace with your email
+    author="Your Name",
+    author_email="your.email@example.com",
     description="A Leatherback robot driving environment for Isaac Lab",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/MuammerBay/isaac-leatherback", # Replace with your repo URL if different
+    url="https://github.com/yourusername/Leatherback",
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",
