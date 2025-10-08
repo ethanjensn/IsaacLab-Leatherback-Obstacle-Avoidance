@@ -92,16 +92,20 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
             horizontal_fov_range=(0.0, 360.0),  # Full 360 degrees
             horizontal_res=0.4,  # 0.4 degree resolution
         ),
-        max_distance=10.0,  # 10m maximum range
+        max_distance=20.0,  # 20m maximum range
         debug_vis=False,  # Disabled initially, enabled after first reset
         visualizer_cfg=BLUE_ARROW_X_MARKER_CFG.replace(
             prim_path="/Visuals/LidarRayCaster",  # Global visualization path
             markers={
                 "hit": sim_utils.SphereCfg(
-                    radius=0.15,  # Medium-sized red hit points
+                    radius=0.2,  # Large red hit points
                     visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),  # Red color
                 ),
-                # Only show hit points, no ray lines to avoid stranded rays
+                "ray": sim_utils.CylinderCfg(
+                    radius=0.05,  # Much thicker ray lines (5cm diameter)
+                    height=1.0,  # Will be scaled to ray length
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),  # Bright green rays
+                ),
             },
         ),
         mesh_prim_paths=[
@@ -117,11 +121,6 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
                 target_prim_expr="{ENV_REGEX_NS}/TestWall",
                 track_mesh_transforms=True,  # Wall moves during reset
             ),
-            # Exclude robot from lidar detection to avoid self-collision
-            # MultiMeshRayCasterCfg.RaycastTargetCfg(
-            #     target_prim_expr="{ENV_REGEX_NS}/Robot/.*",
-            #     track_mesh_transforms=True,
-            # ),
         ],
     )
 
@@ -363,24 +362,6 @@ class LeatherbackEnv(DirectRLEnv):
         # Get Lidar data from RayCaster sensor
         lidar_data = self.lidar.data.ray_hits_w  # Shape: (num_envs, num_rays, 3) - hit positions
         lidar_distances = torch.norm(lidar_data - self.lidar.data.pos_w.unsqueeze(1), dim=-1)  # Calculate distances
-        
-        # Debug: Print lidar detection info for first environment
-        if hasattr(self, '_debug_counter'):
-            self._debug_counter += 1
-        else:
-            self._debug_counter = 1
-            
-        if self._debug_counter % 60 == 0:  # Print every 60 steps (1 second at 60fps)
-            env_0_hits = lidar_distances[0]  # First environment
-            valid_hits = env_0_hits < 10.0  # Within max range
-            num_valid_hits = torch.sum(valid_hits).item()
-            min_dist = torch.min(env_0_hits).item()
-            
-            print(f"[LIDAR DEBUG] Env 0: {num_valid_hits} valid hits, min distance: {min_dist:.2f}m")
-            if num_valid_hits > 0:
-                valid_distances = env_0_hits[valid_hits]
-                print(f"[LIDAR DEBUG] Distances: {valid_distances[:5].tolist()}...")  # Show first 5 distances
-        
         lidar_min_distance = torch.min(lidar_distances, dim=1)[0]  # Min distance per environment
         
         obs = torch.cat(
@@ -584,7 +565,7 @@ class LeatherbackEnv(DirectRLEnv):
         if hasattr(self, '_prims_initialized'):
             self._reset_obstacle_positions(env_ids)
         
-        # Enable lidar hit point visualization after first reset (no ray lines to avoid artifacts)
+        # Enable lidar visualization after first reset to avoid ghost at origin
         if not hasattr(self, '_lidar_vis_enabled'):
             self.lidar.set_debug_vis(True)
             self._lidar_vis_enabled = True
@@ -844,7 +825,6 @@ class LeatherbackEnv(DirectRLEnv):
             print(f"[DEBUG] WARNING: Scene has no sensors attribute!")
         
         print(f"[DEBUG] === END CONTACT SENSORS DEBUG ===")
-
 
 
 
