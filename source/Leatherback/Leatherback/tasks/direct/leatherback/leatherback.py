@@ -10,8 +10,9 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 
-# USD path
-USD_PATH = r"C:\IsaacLab\leatherback_car\Leatherback\leatherback - Copy.usd"
+# USD path with proper resolution for cross-platform compatibility
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+USD_PATH = os.path.join(CURRENT_DIR, "custom_assets", "leatherback_shocks.usd")
 
 LEATHERBACK_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
