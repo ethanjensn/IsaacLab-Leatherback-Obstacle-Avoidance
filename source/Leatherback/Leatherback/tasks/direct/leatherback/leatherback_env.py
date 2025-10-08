@@ -92,7 +92,7 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
             horizontal_fov_range=(0.0, 360.0),  # Full 360 degrees
             horizontal_res=2.0,  # 2 degree resolution (fewer rays, cleaner visualization)
         ),
-        max_distance=10.0,  # 10m maximum range
+        max_distance=20.0,  # 20m maximum range
         debug_vis=False,  # Disabled initially, enabled after first reset
         visualizer_cfg=BLUE_ARROW_X_MARKER_CFG.replace(
             prim_path="/Visuals/LidarRayCaster",  # Global visualization path
@@ -129,7 +129,7 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
 @configclass
 class LeatherbackEnvCfg(DirectRLEnvCfg):
     decimation = 4
-    episode_length_s = 20.0
+    episode_length_s = 40.0
     action_space = 6
     observation_space = 13  # Updated to include Lidar data
     state_space = 0
@@ -271,6 +271,9 @@ class LeatherbackEnv(DirectRLEnv):
         # Don't filter collisions - obstacles are per-environment and need to collide with robot
         # self.scene.filter_collisions(global_prim_paths=[])  # Disabled - prevents obstacle collisions
         self.scene.articulations["leatherback"] = self.leatherback
+        
+        # Register sensors with scene AFTER cloning to ensure proper multi-env initialization
+        # This prevents race conditions and ensures all environments have valid sensor data
         self.scene.sensors["lidar"] = self.lidar
         
         # Contact sensors and lidar are now configured in the scene configuration
@@ -327,7 +330,7 @@ class LeatherbackEnv(DirectRLEnv):
                 
                 # Spawn obstacle with initial position - EXACTLY like test obstacle
                 obstacle_cfg.func(prim_path, obstacle_cfg, translation=initial_pos)
-                print(f"[DEBUG] Created obstacle {obs_idx} for env {env_idx} with size {width.item():.2f}x{depth.item():.2f}x{height.item():.2f}")
+                # print(f"[DEBUG] Created obstacle {obs_idx} for env {env_idx} with size {width.item():.2f}x{depth.item():.2f}x{height.item():.2f}")
 
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -377,23 +380,31 @@ class LeatherbackEnv(DirectRLEnv):
         lidar_data = self.lidar.data.ray_hits_w  # Shape: (num_envs, num_rays, 3) - hit positions
         lidar_distances = torch.norm(lidar_data - self.lidar.data.pos_w.unsqueeze(1), dim=-1)  # Calculate distances
         
+        # Handle inf values (when ray doesn't hit anything)
+        # Replace inf with max_distance to avoid numerical issues
+        lidar_distances = torch.where(
+            torch.isinf(lidar_distances),
+            torch.full_like(lidar_distances, self.cfg.scene.lidar.max_distance),
+            lidar_distances
+        )
+        
         # Store minimum lidar distance per environment
         self.lidar_min_distance = torch.min(lidar_distances, dim=1)[0]  # Min distance per environment
         
-        # Periodic debug: Print lidar status every 2 seconds (120 steps at 60fps)
-        if not hasattr(self, '_lidar_debug_counter'):
-            self._lidar_debug_counter = 0
-        self._lidar_debug_counter += 1
-        
-        if self._lidar_debug_counter % 120 == 0:
-            # Print lidar statistics for first 2 environments
-            for env_idx in range(min(2, self.num_envs)):
-                env_distances = lidar_distances[env_idx]
-                valid_hits = env_distances < 10.0  # Within max range
-                num_valid = torch.sum(valid_hits).item()
-                min_dist = self.lidar_min_distance[env_idx].item()
-                
-                print(f"[LIDAR] Env {env_idx}: {num_valid}/180 rays hit obstacles, min distance: {min_dist:.2f}m")
+        # # Periodic debug: Print lidar status every 2 seconds (120 steps at 60fps)
+        # if not hasattr(self, '_lidar_debug_counter'):
+        #     self._lidar_debug_counter = 0
+        # self._lidar_debug_counter += 1
+        # 
+        # if self._lidar_debug_counter % 120 == 0:
+        #     # Print lidar statistics for first 2 environments
+        #     for env_idx in range(min(2, self.num_envs)):
+        #         env_distances = lidar_distances[env_idx]
+        #         valid_hits = env_distances < 10.0  # Within max range
+        #         num_valid = torch.sum(valid_hits).item()
+        #         min_dist = self.lidar_min_distance[env_idx].item()
+        #         
+        #         print(f"[LIDAR] Env {env_idx}: {num_valid}/180 rays hit obstacles, min distance: {min_dist:.2f}m")
         
         obs = torch.cat(
             (
@@ -415,20 +426,20 @@ class LeatherbackEnv(DirectRLEnv):
         )
         
         if torch.any(obs.isnan()):
-            print("=" * 80)
-            print("NaN DETECTED IN OBSERVATIONS!")
-            print("=" * 80)
-            print(f"Position error NaN: {torch.any(self._position_error.isnan())}")
-            print(f"Target heading error NaN: {torch.any(self.target_heading_error.isnan())}")
-            print(f"Root lin vel x NaN: {torch.any(self.leatherback.data.root_lin_vel_b[:, 0].isnan())}")
-            print(f"Root lin vel y NaN: {torch.any(self.leatherback.data.root_lin_vel_b[:, 1].isnan())}")
-            print(f"Root ang vel z NaN: {torch.any(self.leatherback.data.root_ang_vel_w[:, 2].isnan())}")
-            print(f"Throttle state NaN: {torch.any(self._throttle_state.isnan())}")
-            print(f"Steering state NaN: {torch.any(self._steering_state.isnan())}")
-            print(f"\nRoot position: {self.leatherback.data.root_pos_w[obs.isnan().any(dim=1)]}")
-            print(f"Root velocity: {self.leatherback.data.root_lin_vel_b[obs.isnan().any(dim=1)]}")
-            print(f"Heading: {self.leatherback.data.heading_w[obs.isnan().any(dim=1)]}")
-            print("=" * 80)
+            # print("=" * 80)
+            # print("NaN DETECTED IN OBSERVATIONS!")
+            # print("=" * 80)
+            # print(f"Position error NaN: {torch.any(self._position_error.isnan())}")
+            # print(f"Target heading error NaN: {torch.any(self.target_heading_error.isnan())}")
+            # print(f"Root lin vel x NaN: {torch.any(self.leatherback.data.root_lin_vel_b[:, 0].isnan())}")
+            # print(f"Root lin vel y NaN: {torch.any(self.leatherback.data.root_lin_vel_b[:, 1].isnan())}")
+            # print(f"Root ang vel z NaN: {torch.any(self.leatherback.data.root_ang_vel_w[:, 2].isnan())}")
+            # print(f"Throttle state NaN: {torch.any(self._throttle_state.isnan())}")
+            # print(f"Steering state NaN: {torch.any(self._steering_state.isnan())}")
+            # print(f"\nRoot position: {self.leatherback.data.root_pos_w[obs.isnan().any(dim=1)]}")
+            # print(f"Root velocity: {self.leatherback.data.root_lin_vel_b[obs.isnan().any(dim=1)]}")
+            # print(f"Heading: {self.leatherback.data.heading_w[obs.isnan().any(dim=1)]}")
+            # print("=" * 80)
             raise ValueError("Observations cannot be NAN")
 
         return {"policy": obs}
@@ -445,10 +456,18 @@ class LeatherbackEnv(DirectRLEnv):
         # Shock position penalty (penalize large compression) - use actual joint positions
         shock_positions = self.leatherback.data.joint_pos[:, self._shock_dof_idx]
         shock_compression = torch.abs(shock_positions)
-        R_shock_pos = self.shock_pos_weight * torch.sum(shock_compression, dim=1)
         
         # Shock velocity penalty (penalize high shock velocity/oscillation)
         shock_velocities = torch.abs(self.leatherback.data.joint_vel[:, self._shock_dof_idx])
+        
+        # Check for NaN in joint data (can happen during multi-env sensor updates)
+        if torch.any(torch.isnan(shock_positions)) or torch.any(torch.isnan(shock_velocities)):
+            # Use zeros for this step if data is corrupted
+            shock_positions = torch.where(torch.isnan(shock_positions), torch.zeros_like(shock_positions), shock_positions)
+            shock_velocities = torch.where(torch.isnan(shock_velocities), torch.zeros_like(shock_velocities), shock_velocities)
+            shock_compression = torch.abs(shock_positions)
+        
+        R_shock_pos = self.shock_pos_weight * torch.sum(shock_compression, dim=1)
         R_shock_vel = self.shock_vel_weight * torch.sum(shock_velocities, dim=1)
         
         # Wheel contact bonus (simplified - check if wheels are close to ground level)
@@ -463,7 +482,7 @@ class LeatherbackEnv(DirectRLEnv):
         
         # Obstacle collision penalty
         obstacle_collision = self._check_obstacle_collisions()
-        R_collision = -10.0 * obstacle_collision.float()  # Penalty for hitting obstacles
+        R_collision = -20.0 * obstacle_collision.float()  # Penalty for hitting obstacles (2 waypoints worth)
         
         # Lidar-based rewards for obstacle avoidance
         # Use the minimum lidar distance from observations
@@ -500,23 +519,23 @@ class LeatherbackEnv(DirectRLEnv):
         self.waypoints.visualize(marker_indices=marker_indices)
 
         if torch.any(composite_reward.isnan()):
-            print("=" * 80)
-            print("NaN DETECTED IN REWARDS!")
-            print("=" * 80)
-            print(f"Position progress NaN: {torch.any((position_progress_rew * self.position_progress_weight).isnan())}")
-            print(f"Target heading NaN: {torch.any((target_heading_rew * self.heading_progress_weight).isnan())}")
-            print(f"Goal reached NaN: {torch.any((goal_reached * self.goal_reached_bonus).isnan())}")
-            print(f"Shock pos NaN: {torch.any(R_shock_pos.isnan())}")
-            print(f"Shock vel NaN: {torch.any(R_shock_vel.isnan())}")
-            print(f"Wheel contact NaN: {torch.any(R_wheel_contact.isnan())}")
-            print(f"Shock act NaN: {torch.any(R_shock_act.isnan())}")
-            print(f"Collision NaN: {torch.any(R_collision.isnan())}")
-            print(f"Lidar safe NaN: {torch.any(R_lidar_safe.isnan())}")
-            print(f"Lidar danger NaN: {torch.any(R_lidar_danger.isnan())}")
-            print(f"Lidar collision NaN: {torch.any(R_lidar_collision.isnan())}")
-            print(f"\nLidar min distance: {self.lidar_min_distance}")
-            print(f"Lidar min distance NaN mask: {self.lidar_min_distance.isnan()}")
-            print("=" * 80)
+            # print("=" * 80)
+            # print("NaN DETECTED IN REWARDS!")
+            # print("=" * 80)
+            # print(f"Position progress NaN: {torch.any((position_progress_rew * self.position_progress_weight).isnan())}")
+            # print(f"Target heading NaN: {torch.any((target_heading_rew * self.heading_progress_weight).isnan())}")
+            # print(f"Goal reached NaN: {torch.any((goal_reached * self.goal_reached_bonus).isnan())}")
+            # print(f"Shock pos NaN: {torch.any(R_shock_pos.isnan())}")
+            # print(f"Shock vel NaN: {torch.any(R_shock_vel.isnan())}")
+            # print(f"Wheel contact NaN: {torch.any(R_wheel_contact.isnan())}")
+            # print(f"Shock act NaN: {torch.any(R_shock_act.isnan())}")
+            # print(f"Collision NaN: {torch.any(R_collision.isnan())}")
+            # print(f"Lidar safe NaN: {torch.any(R_lidar_safe.isnan())}")
+            # print(f"Lidar danger NaN: {torch.any(R_lidar_danger.isnan())}")
+            # print(f"Lidar collision NaN: {torch.any(R_lidar_collision.isnan())}")
+            # print(f"\nLidar min distance: {self.lidar_min_distance}")
+            # print(f"Lidar min distance NaN mask: {self.lidar_min_distance.isnan()}")
+            # print("=" * 80)
             raise ValueError("Rewards cannot be NAN")
 
         return composite_reward
@@ -537,8 +556,14 @@ class LeatherbackEnv(DirectRLEnv):
                         contact_data = contact_sensor.data
                         
                         if contact_data.net_forces_w is not None:
+                            # Check for NaN in contact forces (can happen during initialization)
+                            forces = contact_data.net_forces_w
+                            if torch.any(torch.isnan(forces)):
+                                # Skip this sensor if data is invalid
+                                continue
+                            
                             # Get force magnitude
-                            force_magnitudes = torch.norm(contact_data.net_forces_w, dim=-1)
+                            force_magnitudes = torch.norm(forces, dim=-1)
                             max_forces = torch.max(force_magnitudes, dim=1)[0]
                             
                             # Different thresholds for different sensors
@@ -552,11 +577,11 @@ class LeatherbackEnv(DirectRLEnv):
                             sensor_collision = max_forces > threshold
                             collision_detected = collision_detected | sensor_collision
                             
-                            # Debug output
-                            if torch.any(sensor_collision):
-                                for env_idx in range(self.num_envs):
-                                    if sensor_collision[env_idx]:
-                                        print(f"[COLLISION DETECTED] Env {env_idx}: {sensor_name} hit obstacle! Force: {max_forces[env_idx]:.1f}N")
+                            # # Debug output
+                            # if torch.any(sensor_collision):
+                            #     for env_idx in range(self.num_envs):
+                            #         if sensor_collision[env_idx]:
+                            #             print(f"[COLLISION DETECTED] Env {env_idx}: {sensor_name} hit obstacle! Force: {max_forces[env_idx]:.1f}N")
         
         return collision_detected
 
@@ -604,16 +629,16 @@ class LeatherbackEnv(DirectRLEnv):
             self._obstacle_1_view.initialize()
             # self._wall_view.initialize()
             self._prims_initialized = True
-            print(f"[DEBUG] Initialized obstacle views (2 obstacle views, wall view disabled)")
+            # print(f"[DEBUG] Initialized obstacle views (2 obstacle views, wall view disabled)")
         
         # Reset contact sensors after episode reset
         self._reset_contact_sensors(env_ids)
         
-        # Debug: Check sensors once at startup
-        if len(env_ids) > 0 and env_ids[0] == 0 and not hasattr(self, '_sensors_debugged'):
-            self._debug_contact_sensors()
-            self._debug_robot_bodies()
-            self._sensors_debugged = True
+        # # Debug: Check sensors once at startup
+        # if len(env_ids) > 0 and env_ids[0] == 0 and not hasattr(self, '_sensors_debugged'):
+        #     self._debug_contact_sensors()
+        #     self._debug_robot_bodies()
+        #     self._sensors_debugged = True
 
         self._target_positions[env_ids, :, :] = 0.0
         self._markers_pos[env_ids, :, :] = 0.0
@@ -633,10 +658,10 @@ class LeatherbackEnv(DirectRLEnv):
         if hasattr(self, '_prims_initialized'):
             self._reset_obstacle_positions(env_ids)
         
-        # Disable lidar visualization to avoid crashes with multi-env
-        # if not hasattr(self, '_lidar_vis_enabled'):
-        #     self.lidar.set_debug_vis(True)
-        #     self._lidar_vis_enabled = True
+        # Enable lidar visualization after first reset (when sensors are properly initialized)
+        if not hasattr(self, '_lidar_vis_enabled'):
+            self.lidar.set_debug_vis(True)
+            self._lidar_vis_enabled = True
 
         current_target_positions = self._target_positions[self.leatherback._ALL_INDICES, self._target_index]
         self._position_error_vector = current_target_positions[:, :2] - self.leatherback.data.root_pos_w[:, :2]
@@ -709,12 +734,12 @@ class LeatherbackEnv(DirectRLEnv):
                         rotate_op = xform.AddRotateZOp()
                         rotate_op.Set(90.0)  # 90 degrees rotation
                         
-                        print(f"[DEBUG] Positioned obstacle {obs_idx} at ({obs_x.item():.2f}, {obs_y.item():.2f}, {obs_z.item():.2f})")
+                        # print(f"[DEBUG] Positioned obstacle {obs_idx} at ({obs_x.item():.2f}, {obs_y.item():.2f}, {obs_z.item():.2f})")
 
 
     def _create_obstacles_for_source_env(self):
         """Create obstacles only for the source environment (env_0) at scene setup time."""
-        print(f"[DEBUG] Creating obstacles for source environment only (will be cloned)...")
+        # print(f"[DEBUG] Creating obstacles for source environment only (will be cloned)...")
         
         if self._obstacle_sizes is None:
             self._obstacle_sizes = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=torch.float32)
@@ -738,7 +763,7 @@ class LeatherbackEnv(DirectRLEnv):
             )
             obstacle_cfg.func(prim_path, obstacle_cfg, translation=(0.0, 0.0, 0.55))
         
-        print(f"[DEBUG] Created 2 obstacles for source environment (test walls disabled)")
+        # print(f"[DEBUG] Created 2 obstacles for source environment (test walls disabled)")
     
     def _reset_obstacle_positions(self, env_ids: Sequence[int]):
         """Reset obstacle positions for given environments by moving them using RigidPrimView."""
@@ -800,30 +825,31 @@ class LeatherbackEnv(DirectRLEnv):
         # wall_orientations = quat_90z.unsqueeze(0).repeat(num_reset, 1)
         # self._wall_view.set_world_poses(wall_positions, wall_orientations, indices=env_ids_tensor)
         
-        print(f"[OBSTACLES] Reset {num_reset} environments: Obstacles repositioned")
+        # print(f"[OBSTACLES] Reset {num_reset} environments: Obstacles repositioned")
 
     def _debug_robot_bodies(self):
         """Debug method to list all rigid bodies (simplified, no PhysX API calls)."""
-        import isaacsim.core.utils.prims as prim_utils
-        import omni
-        
-        print(f"[DEBUG] === ROBOT BODIES DEBUG ===")
-        
-        try:
-            stage = omni.usd.get_context().get_stage()
-            rigid_bodies_path = f"/World/envs/env_0/Robot/Rigid_Bodies"
-            rigid_bodies_prim = stage.GetPrimAtPath(rigid_bodies_path)
-            
-            if rigid_bodies_prim.IsValid():
-                print(f"[DEBUG] Found Rigid_Bodies prim at {rigid_bodies_path}")
-                rigid_body_names = [child.GetName() for child in rigid_bodies_prim.GetChildren()]
-                print(f"[DEBUG] Rigid bodies: {rigid_body_names}")
-            else:
-                print(f"[DEBUG] Rigid_Bodies prim not found at {rigid_bodies_path}")
-        except Exception as e:
-            print(f"[DEBUG] Error debugging robot bodies: {e}")
-        
-        print(f"[DEBUG] === END ROBOT BODIES DEBUG ===")
+        pass
+        # import isaacsim.core.utils.prims as prim_utils
+        # import omni
+        # 
+        # print(f"[DEBUG] === ROBOT BODIES DEBUG ===")
+        # 
+        # try:
+        #     stage = omni.usd.get_context().get_stage()
+        #     rigid_bodies_path = f"/World/envs/env_0/Robot/Rigid_Bodies"
+        #     rigid_bodies_prim = stage.GetPrimAtPath(rigid_bodies_path)
+        #     
+        #     if rigid_bodies_prim.IsValid():
+        #         print(f"[DEBUG] Found Rigid_Bodies prim at {rigid_bodies_path}")
+        #         rigid_body_names = [child.GetName() for child in rigid_bodies_prim.GetChildren()]
+        #         print(f"[DEBUG] Rigid bodies: {rigid_body_names}")
+        #     else:
+        #         print(f"[DEBUG] Rigid_Bodies prim not found at {rigid_bodies_path}")
+        # except Exception as e:
+        #     print(f"[DEBUG] Error debugging robot bodies: {e}")
+        # 
+        # print(f"[DEBUG] === END ROBOT BODIES DEBUG ===")
 
     def _reset_contact_sensors(self, env_ids: Sequence[int]):
         """Reset and reinitialize contact sensors after episode reset."""
@@ -856,34 +882,35 @@ class LeatherbackEnv(DirectRLEnv):
                     if hasattr(contact_sensor.data, 'net_forces_w') and contact_sensor.data.net_forces_w is not None:
                         contact_sensor.data.net_forces_w.zero_()
                 
-                print(f"[DEBUG] Reset contact sensor: {sensor_name}")
+                # print(f"[DEBUG] Reset contact sensor: {sensor_name}")
 
     def _debug_contact_sensors(self):
         """Debug method to check contact sensor status."""
-        print(f"[DEBUG] === CONTACT SENSORS DEBUG ===")
-        
-        if hasattr(self.scene, 'sensors'):
-            print(f"[DEBUG] Scene sensors created: {list(self.scene.sensors.keys())}")
-            expected_sensors = ['contact_chassis', 'contact_wheel_front_left', 'contact_wheel_front_right', 'contact_wheel_rear_right', 'contact_wheel_rear_left']
-            
-            for sensor_name in expected_sensors:
-                if sensor_name in self.scene.sensors:
-                    contact_sensor = self.scene.sensors[sensor_name]
-                    print(f"[DEBUG] ✓ {sensor_name} successfully created by scene")
-                    print(f"[DEBUG]   - Initialized: {hasattr(contact_sensor, 'is_initialized') and contact_sensor.is_initialized}")
-                    print(f"[DEBUG]   - Has data: {hasattr(contact_sensor, 'data') and contact_sensor.data is not None}")
-                    
-                    if hasattr(contact_sensor, 'data') and hasattr(contact_sensor.data, 'net_forces_w'):
-                        forces = contact_sensor.data.net_forces_w
-                        print(f"[DEBUG]   - Forces shape: {forces.shape if forces is not None else 'None'}")
-                        if forces is not None:
-                            print(f"[DEBUG]   - Max force: {torch.max(torch.norm(forces, dim=-1)).item():.6f}N")
-                else:
-                    print(f"[DEBUG] ✗ {sensor_name} NOT created by scene!")
-        else:
-            print(f"[DEBUG] WARNING: Scene has no sensors attribute!")
-        
-        print(f"[DEBUG] === END CONTACT SENSORS DEBUG ===")
+        pass
+        # print(f"[DEBUG] === CONTACT SENSORS DEBUG ===")
+        # 
+        # if hasattr(self.scene, 'sensors'):
+        #     print(f"[DEBUG] Scene sensors created: {list(self.scene.sensors.keys())}")
+        #     expected_sensors = ['contact_chassis', 'contact_wheel_front_left', 'contact_wheel_front_right', 'contact_wheel_rear_right', 'contact_wheel_rear_left']
+        #     
+        #     for sensor_name in expected_sensors:
+        #         if sensor_name in self.scene.sensors:
+        #             contact_sensor = self.scene.sensors[sensor_name]
+        #             print(f"[DEBUG] ✓ {sensor_name} successfully created by scene")
+        #             print(f"[DEBUG]   - Initialized: {hasattr(contact_sensor, 'is_initialized') and contact_sensor.is_initialized}")
+        #             print(f"[DEBUG]   - Has data: {hasattr(contact_sensor, 'data') and contact_sensor.data is not None}")
+        #             
+        #             if hasattr(contact_sensor, 'data') and hasattr(contact_sensor.data, 'net_forces_w'):
+        #                 forces = contact_sensor.data.net_forces_w
+        #                 print(f"[DEBUG]   - Forces shape: {forces.shape if forces is not None else 'None'}")
+        #                 if forces is not None:
+        #                     print(f"[DEBUG]   - Max force: {torch.max(torch.norm(forces, dim=-1)).item():.6f}N")
+        #         else:
+        #             print(f"[DEBUG] ✗ {sensor_name} NOT created by scene!")
+        # else:
+        #     print(f"[DEBUG] WARNING: Scene has no sensors attribute!")
+        # 
+        # print(f"[DEBUG] === END CONTACT SENSORS DEBUG ===")
 
 
 
