@@ -90,7 +90,7 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
             channels=1,  # Single horizontal plane
             vertical_fov_range=(0.0, 0.0),  # 0 degrees vertical FOV
             horizontal_fov_range=(0.0, 360.0),  # Full 360 degrees
-            horizontal_res=0.4,  # 0.4 degree resolution
+            horizontal_res=2.0,  # 2 degree resolution (fewer rays, cleaner visualization)
         ),
         max_distance=10.0,  # 10m maximum range
         debug_vis=False,  # Disabled initially, enabled after first reset
@@ -113,10 +113,11 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
                 target_prim_expr="{ENV_REGEX_NS}/TestObstacle_.*",
                 track_mesh_transforms=True,  # Obstacles move during reset
             ),
-            MultiMeshRayCasterCfg.RaycastTargetCfg(
-                target_prim_expr="{ENV_REGEX_NS}/TestWall",
-                track_mesh_transforms=True,  # Wall moves during reset
-            ),
+            # Test wall commented out - no walls to detect
+            # MultiMeshRayCasterCfg.RaycastTargetCfg(
+            #     target_prim_expr="{ENV_REGEX_NS}/TestWall",
+            #     track_mesh_transforms=True,  # Wall moves during reset
+            # ),
             # Exclude robot from lidar detection to avoid self-collision
             # MultiMeshRayCasterCfg.RaycastTargetCfg(
             #     target_prim_expr="{ENV_REGEX_NS}/Robot/.*",
@@ -205,6 +206,7 @@ class LeatherbackEnv(DirectRLEnv):
         self._shock_targets = torch.zeros((self.num_envs,4), device=self.device, dtype=torch.float32)
         self._shock_targets[:, 0:2] = -0.030  # Rear shocks
         self._shock_targets[:, 2:4] = 0.030   # Front shocks
+        self._shock_action = torch.zeros((self.num_envs,4), device=self.device, dtype=torch.float32)  # Initialize for rewards
         self._goal_reached = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
         self.task_completed = torch.zeros((self.num_envs), device=self.device, dtype=torch.bool)
         self._num_goals = 10
@@ -225,6 +227,13 @@ class LeatherbackEnv(DirectRLEnv):
         self.shock_vel_weight = -0.0005
         self.wheel_contact_bonus = 0.01
         self.shock_action_penalty = -0.0001
+        
+        # Lidar-based reward parameters (minimal like other rewards)
+        self.lidar_safe_distance = 2.0  # Safe distance threshold (meters)
+        self.lidar_danger_distance = 1.0  # Danger zone threshold (meters)
+        self.lidar_safe_reward = 0.01  # Small reward for maintaining safe distance
+        self.lidar_danger_penalty = -0.05  # Small penalty for getting too close
+        self.lidar_collision_penalty = -0.5  # Moderate penalty for collision
 
     def _setup_scene(self):
         # Add Physics Scene for Lidar to work (required by Isaac Sim 5.0.0)
@@ -255,6 +264,9 @@ class LeatherbackEnv(DirectRLEnv):
         self.lidar = MultiMeshRayCaster(self.cfg.scene.lidar)
         self.object_state = []
         
+        # Create obstacles for source environment BEFORE cloning
+        self._create_obstacles_for_source_env()
+        
         self.scene.clone_environments(copy_from_source=False)
         # Don't filter collisions - obstacles are per-environment and need to collide with robot
         # self.scene.filter_collisions(global_prim_paths=[])  # Disabled - prevents obstacle collisions
@@ -266,9 +278,6 @@ class LeatherbackEnv(DirectRLEnv):
         # Add lighting
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
-        
-        # Create obstacles at scene setup time (required for contact sensors to work)
-        self._create_all_obstacles_at_setup()
 
     def _spawn_obstacles(self):
         """Spawn obstacles for all environments."""
@@ -350,8 +359,12 @@ class LeatherbackEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         current_target_positions = self._target_positions[self.leatherback._ALL_INDICES, self._target_index]
         self._position_error_vector = current_target_positions - self.leatherback.data.root_pos_w[:, :2]
-        self._previous_position_error = self._position_error.clone()
+        # Store previous error first if it exists, otherwise use current error
+        if hasattr(self, '_position_error'):
+            self._previous_position_error = self._position_error.clone()
         self._position_error = torch.norm(self._position_error_vector, dim=-1)
+        if not hasattr(self, '_previous_position_error'):
+            self._previous_position_error = self._position_error.clone()
 
         heading = self.leatherback.data.heading_w
         target_heading_w = torch.atan2(
@@ -364,24 +377,23 @@ class LeatherbackEnv(DirectRLEnv):
         lidar_data = self.lidar.data.ray_hits_w  # Shape: (num_envs, num_rays, 3) - hit positions
         lidar_distances = torch.norm(lidar_data - self.lidar.data.pos_w.unsqueeze(1), dim=-1)  # Calculate distances
         
-        # Debug: Print lidar detection info for first environment
-        if hasattr(self, '_debug_counter'):
-            self._debug_counter += 1
-        else:
-            self._debug_counter = 1
-            
-        if self._debug_counter % 60 == 0:  # Print every 60 steps (1 second at 60fps)
-            env_0_hits = lidar_distances[0]  # First environment
-            valid_hits = env_0_hits < 10.0  # Within max range
-            num_valid_hits = torch.sum(valid_hits).item()
-            min_dist = torch.min(env_0_hits).item()
-            
-            print(f"[LIDAR DEBUG] Env 0: {num_valid_hits} valid hits, min distance: {min_dist:.2f}m")
-            if num_valid_hits > 0:
-                valid_distances = env_0_hits[valid_hits]
-                print(f"[LIDAR DEBUG] Distances: {valid_distances[:5].tolist()}...")  # Show first 5 distances
+        # Store minimum lidar distance per environment
+        self.lidar_min_distance = torch.min(lidar_distances, dim=1)[0]  # Min distance per environment
         
-        lidar_min_distance = torch.min(lidar_distances, dim=1)[0]  # Min distance per environment
+        # Periodic debug: Print lidar status every 2 seconds (120 steps at 60fps)
+        if not hasattr(self, '_lidar_debug_counter'):
+            self._lidar_debug_counter = 0
+        self._lidar_debug_counter += 1
+        
+        if self._lidar_debug_counter % 120 == 0:
+            # Print lidar statistics for first 2 environments
+            for env_idx in range(min(2, self.num_envs)):
+                env_distances = lidar_distances[env_idx]
+                valid_hits = env_distances < 10.0  # Within max range
+                num_valid = torch.sum(valid_hits).item()
+                min_dist = self.lidar_min_distance[env_idx].item()
+                
+                print(f"[LIDAR] Env {env_idx}: {num_valid}/180 rays hit obstacles, min distance: {min_dist:.2f}m")
         
         obs = torch.cat(
             (
@@ -397,7 +409,7 @@ class LeatherbackEnv(DirectRLEnv):
                 self._shock_targets[:, 1].unsqueeze(dim=1),  # Rear left shock
                 self._shock_targets[:, 2].unsqueeze(dim=1),  # Front right shock
                 self._shock_targets[:, 3].unsqueeze(dim=1),  # Front left shock
-                lidar_min_distance.unsqueeze(dim=1),  # Lidar minimum distance
+                self.lidar_min_distance.unsqueeze(dim=1),  # Lidar minimum distance
             ),
             dim=-1,
         )
@@ -452,6 +464,22 @@ class LeatherbackEnv(DirectRLEnv):
         # Obstacle collision penalty
         obstacle_collision = self._check_obstacle_collisions()
         R_collision = -10.0 * obstacle_collision.float()  # Penalty for hitting obstacles
+        
+        # Lidar-based rewards for obstacle avoidance
+        # Use the minimum lidar distance from observations
+        min_lidar_distance = self.lidar_min_distance  # Shape: (num_envs,)
+        
+        # Safe distance reward - encourage maintaining distance from obstacles
+        safe_distance_mask = min_lidar_distance > self.lidar_safe_distance
+        R_lidar_safe = self.lidar_safe_reward * safe_distance_mask.float()
+        
+        # Danger zone penalty - penalize getting too close to obstacles
+        danger_zone_mask = (min_lidar_distance < self.lidar_danger_distance) & (min_lidar_distance > 0.1)
+        R_lidar_danger = self.lidar_danger_penalty * danger_zone_mask.float()
+        
+        # Collision penalty - large penalty for actual collision
+        collision_mask = min_lidar_distance < 0.1  # Very close = collision
+        R_lidar_collision = self.lidar_collision_penalty * collision_mask.float()
 
         composite_reward = (
             position_progress_rew * self.position_progress_weight +
@@ -461,7 +489,10 @@ class LeatherbackEnv(DirectRLEnv):
             R_shock_vel +
             R_wheel_contact +
             R_shock_act +
-            R_collision
+            R_collision +
+            R_lidar_safe +
+            R_lidar_danger +
+            R_lidar_collision
         )
 
         one_hot_encoded = torch.nn.functional.one_hot(self._target_index.long(), num_classes=self._num_goals)
@@ -469,6 +500,23 @@ class LeatherbackEnv(DirectRLEnv):
         self.waypoints.visualize(marker_indices=marker_indices)
 
         if torch.any(composite_reward.isnan()):
+            print("=" * 80)
+            print("NaN DETECTED IN REWARDS!")
+            print("=" * 80)
+            print(f"Position progress NaN: {torch.any((position_progress_rew * self.position_progress_weight).isnan())}")
+            print(f"Target heading NaN: {torch.any((target_heading_rew * self.heading_progress_weight).isnan())}")
+            print(f"Goal reached NaN: {torch.any((goal_reached * self.goal_reached_bonus).isnan())}")
+            print(f"Shock pos NaN: {torch.any(R_shock_pos.isnan())}")
+            print(f"Shock vel NaN: {torch.any(R_shock_vel.isnan())}")
+            print(f"Wheel contact NaN: {torch.any(R_wheel_contact.isnan())}")
+            print(f"Shock act NaN: {torch.any(R_shock_act.isnan())}")
+            print(f"Collision NaN: {torch.any(R_collision.isnan())}")
+            print(f"Lidar safe NaN: {torch.any(R_lidar_safe.isnan())}")
+            print(f"Lidar danger NaN: {torch.any(R_lidar_danger.isnan())}")
+            print(f"Lidar collision NaN: {torch.any(R_lidar_collision.isnan())}")
+            print(f"\nLidar min distance: {self.lidar_min_distance}")
+            print(f"Lidar min distance NaN mask: {self.lidar_min_distance.isnan()}")
+            print("=" * 80)
             raise ValueError("Rewards cannot be NAN")
 
         return composite_reward
@@ -549,13 +597,14 @@ class LeatherbackEnv(DirectRLEnv):
             # Create views for all obstacles using regex patterns
             self._obstacle_0_view = RigidPrim("/World/envs/env_.*/TestObstacle_0", reset_xform_properties=False)
             self._obstacle_1_view = RigidPrim("/World/envs/env_.*/TestObstacle_1", reset_xform_properties=False)
-            self._wall_view = RigidPrim("/World/envs/env_.*/TestWall", reset_xform_properties=False)
+            # Wall view commented out - no test walls
+            # self._wall_view = RigidPrim("/World/envs/env_.*/TestWall", reset_xform_properties=False)
             # Initialize views
             self._obstacle_0_view.initialize()
             self._obstacle_1_view.initialize()
-            self._wall_view.initialize()
+            # self._wall_view.initialize()
             self._prims_initialized = True
-            print(f"[DEBUG] Initialized obstacle views (2 obstacle views + 1 wall view)")
+            print(f"[DEBUG] Initialized obstacle views (2 obstacle views, wall view disabled)")
         
         # Reset contact sensors after episode reset
         self._reset_contact_sensors(env_ids)
@@ -584,10 +633,10 @@ class LeatherbackEnv(DirectRLEnv):
         if hasattr(self, '_prims_initialized'):
             self._reset_obstacle_positions(env_ids)
         
-        # Enable lidar hit point visualization after first reset (no ray lines to avoid artifacts)
-        if not hasattr(self, '_lidar_vis_enabled'):
-            self.lidar.set_debug_vis(True)
-            self._lidar_vis_enabled = True
+        # Disable lidar visualization to avoid crashes with multi-env
+        # if not hasattr(self, '_lidar_vis_enabled'):
+        #     self.lidar.set_debug_vis(True)
+        #     self._lidar_vis_enabled = True
 
         current_target_positions = self._target_positions[self.leatherback._ALL_INDICES, self._target_index]
         self._position_error_vector = current_target_positions[:, :2] - self.leatherback.data.root_pos_w[:, :2]
@@ -663,42 +712,33 @@ class LeatherbackEnv(DirectRLEnv):
                         print(f"[DEBUG] Positioned obstacle {obs_idx} at ({obs_x.item():.2f}, {obs_y.item():.2f}, {obs_z.item():.2f})")
 
 
-    def _create_all_obstacles_at_setup(self):
-        """Create all obstacles for all environments at scene setup time."""
-        print(f"[DEBUG] Creating obstacles for {self.num_envs} environments at scene setup...")
+    def _create_obstacles_for_source_env(self):
+        """Create obstacles only for the source environment (env_0) at scene setup time."""
+        print(f"[DEBUG] Creating obstacles for source environment only (will be cloned)...")
         
         if self._obstacle_sizes is None:
             self._obstacle_sizes = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=torch.float32)
         if self._obstacle_positions is None:
             self._obstacle_positions = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=torch.float32)
         
-        for env_idx in range(self.num_envs):
-            for obs_idx in range(2):
-                prim_path = f"/World/envs/env_{env_idx}/TestObstacle_{obs_idx}"
-                width = torch.rand(1, device=self.device) * (self.cfg.obstacle_width_range[1] - self.cfg.obstacle_width_range[0]) + self.cfg.obstacle_width_range[0]
-                height = torch.rand(1, device=self.device) * (self.cfg.obstacle_height_range[1] - self.cfg.obstacle_height_range[0]) + self.cfg.obstacle_height_range[0]
-                depth = torch.rand(1, device=self.device) * (self.cfg.obstacle_depth_range[1] - self.cfg.obstacle_depth_range[0]) + self.cfg.obstacle_depth_range[0]
-                self._obstacle_sizes[env_idx, obs_idx] = torch.tensor([width.item(), depth.item(), height.item()], device=self.device)
-                obstacle_cfg = CuboidCfg(
-                    size=(width.item(), depth.item(), height.item()),
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=False, disable_gravity=True, max_linear_velocity=0.0, max_angular_velocity=0.0),
-                    mass_props=sim_utils.MassPropertiesCfg(mass=10000.0),
-                    collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True, contact_offset=0.02, rest_offset=0.0),
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0) if obs_idx == 0 else (0.0, 0.0, 1.0)),
-                )
-                obstacle_cfg.func(prim_path, obstacle_cfg, translation=(0.0, 0.0, 0.55))
-            
-            test_wall_path = f"/World/envs/env_{env_idx}/TestWall"
-            wall_cfg = CuboidCfg(
-                size=(3.0, 0.5, 2.0),
+        # Only create obstacles for env_0 (source environment)
+        env_idx = 0
+        for obs_idx in range(2):
+            prim_path = f"/World/envs/env_{env_idx}/TestObstacle_{obs_idx}"
+            width = torch.rand(1, device=self.device) * (self.cfg.obstacle_width_range[1] - self.cfg.obstacle_width_range[0]) + self.cfg.obstacle_width_range[0]
+            height = torch.rand(1, device=self.device) * (self.cfg.obstacle_height_range[1] - self.cfg.obstacle_height_range[0]) + self.cfg.obstacle_height_range[0]
+            depth = torch.rand(1, device=self.device) * (self.cfg.obstacle_depth_range[1] - self.cfg.obstacle_depth_range[0]) + self.cfg.obstacle_depth_range[0]
+            self._obstacle_sizes[env_idx, obs_idx] = torch.tensor([width.item(), depth.item(), height.item()], device=self.device)
+            obstacle_cfg = CuboidCfg(
+                size=(width.item(), depth.item(), height.item()),
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=False, disable_gravity=True, max_linear_velocity=0.0, max_angular_velocity=0.0),
-                mass_props=sim_utils.MassPropertiesCfg(mass=100000.0),
+                mass_props=sim_utils.MassPropertiesCfg(mass=10000.0),
                 collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True, contact_offset=0.02, rest_offset=0.0),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0) if obs_idx == 0 else (0.0, 0.0, 1.0)),
             )
-            wall_cfg.func(test_wall_path, wall_cfg, translation=(0.0, 0.0, 1.0))
+            obstacle_cfg.func(prim_path, obstacle_cfg, translation=(0.0, 0.0, 0.55))
         
-        print(f"[DEBUG] Created {self.num_envs * 2} obstacles + {self.num_envs} test walls at scene setup")
+        print(f"[DEBUG] Created 2 obstacles for source environment (test walls disabled)")
     
     def _reset_obstacle_positions(self, env_ids: Sequence[int]):
         """Reset obstacle positions for given environments by moving them using RigidPrimView."""
@@ -752,15 +792,15 @@ class LeatherbackEnv(DirectRLEnv):
         obs1_orientations = quat_90z.unsqueeze(0).repeat(num_reset, 1)  # Shape: (num_reset, 4)
         self._obstacle_1_view.set_world_poses(obs1_positions, obs1_orientations, indices=env_ids_tensor)
         
-        # Move TEST WALLS - place them 3m in front of robot spawn
-        robot_positions = self.leatherback.data.root_pos_w[env_ids]  # Shape: (num_reset, 3)
-        wall_positions = robot_positions.clone()
-        wall_positions[:, 0] += 3.0  # 3m in front
-        wall_positions[:, 2] = 1.0   # Ground level (wall is 2m tall)
-        wall_orientations = quat_90z.unsqueeze(0).repeat(num_reset, 1)
-        self._wall_view.set_world_poses(wall_positions, wall_orientations, indices=env_ids_tensor)
+        # Test walls commented out - no walls to reset
+        # robot_positions = self.leatherback.data.root_pos_w[env_ids]  # Shape: (num_reset, 3)
+        # wall_positions = robot_positions.clone()
+        # wall_positions[:, 0] += 3.0  # 3m in front
+        # wall_positions[:, 2] = 1.0   # Ground level (wall is 2m tall)
+        # wall_orientations = quat_90z.unsqueeze(0).repeat(num_reset, 1)
+        # self._wall_view.set_world_poses(wall_positions, wall_orientations, indices=env_ids_tensor)
         
-        print(f"[WALL] Reset {num_reset} environments: Walls placed 3m ahead of robots")
+        print(f"[OBSTACLES] Reset {num_reset} environments: Obstacles repositioned")
 
     def _debug_robot_bodies(self):
         """Debug method to list all rigid bodies (simplified, no PhysX API calls)."""
