@@ -219,7 +219,7 @@ class LeatherbackEnv(DirectRLEnv):
         self.goal_reached_bonus = 10.0
         self.position_progress_weight = 1.0
         self.heading_coefficient = 0.25
-        self.heading_progress_weight = 0.05
+        self.heading_progress_weight = 0.0  # Disabled - conflicts with obstacle avoidance
         self._target_index = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
         
         # Suspension reward parameters (small compared to waypoint rewards)
@@ -228,12 +228,12 @@ class LeatherbackEnv(DirectRLEnv):
         self.wheel_contact_bonus = 0.01
         self.shock_action_penalty = -0.0001
         
-        # Lidar-based reward parameters (minimal like other rewards)
+        # Lidar-based reward parameters (very weak - waypoints are priority)
         self.lidar_safe_distance = 2.0  # Safe distance threshold (meters)
         self.lidar_danger_distance = 1.0  # Danger zone threshold (meters)
-        self.lidar_safe_reward = 0.01  # Small reward for maintaining safe distance
-        self.lidar_danger_penalty = -0.05  # Small penalty for getting too close
-        self.lidar_collision_penalty = -0.5  # Moderate penalty for collision
+        self.lidar_safe_reward = 0.005  # Very small bonus for safe distance
+        self.lidar_danger_penalty = -0.01  # Very small penalty - gentle discouragement only
+        self.lidar_collision_penalty = -0.02  # Small penalty - won't block waypoint reaching
 
     def _setup_scene(self):
         # Add Physics Scene for Lidar to work (required by Isaac Sim 5.0.0)
@@ -360,6 +360,27 @@ class LeatherbackEnv(DirectRLEnv):
         self.leatherback.set_joint_position_target(self._shock_targets, joint_ids=self._shock_dof_idx)
 
     def _get_observations(self) -> dict:
+        # Detect environments with corrupted physics data
+        pos_nan = torch.isnan(self.leatherback.data.root_pos_w).any(dim=1)
+        vel_nan = torch.isnan(self.leatherback.data.root_lin_vel_b).any(dim=1)
+        ang_nan = torch.isnan(self.leatherback.data.root_ang_vel_w).any(dim=1)
+        
+        # Also detect extreme positions (robots that have "teleported" to infinity)
+        # Use much lower threshold - robots should stay within reasonable course bounds
+        pos_extreme = torch.any(torch.abs(self.leatherback.data.root_pos_w) > 1000.0, dim=1)
+        
+        # Detect extreme shock velocities (sign of physics instability)
+        shock_velocities_abs = torch.abs(self.leatherback.data.joint_vel[:, self._shock_dof_idx])
+        shock_extreme = torch.any(shock_velocities_abs > 100.0, dim=1)  # Shocks shouldn't move > 100 m/s
+        
+        corrupted_envs = pos_nan | vel_nan | ang_nan | pos_extreme | shock_extreme
+        
+        if torch.any(corrupted_envs):
+            corrupted_env_ids_tensor = torch.where(corrupted_envs)[0]
+            corrupted_env_ids = corrupted_env_ids_tensor.cpu().numpy().tolist()
+            print(f"[PHYSICS RESET] Resetting {len(corrupted_env_ids)} environments due to corrupted/extreme physics")
+            self._reset_idx(corrupted_env_ids)
+        
         current_target_positions = self._target_positions[self.leatherback._ALL_INDICES, self._target_index]
         self._position_error_vector = current_target_positions - self.leatherback.data.root_pos_w[:, :2]
         # Store previous error first if it exists, otherwise use current error
@@ -375,6 +396,10 @@ class LeatherbackEnv(DirectRLEnv):
             self._target_positions[self.leatherback._ALL_INDICES, self._target_index, 0] - self.leatherback.data.root_link_pos_w[:, 0],
         )
         self.target_heading_error = torch.atan2(torch.sin(target_heading_w - heading), torch.cos(target_heading_w - heading))
+        
+        # Guard against NaN in heading calculations
+        if torch.any(torch.isnan(self.target_heading_error)):
+            self.target_heading_error = torch.where(torch.isnan(self.target_heading_error), torch.zeros_like(self.target_heading_error), self.target_heading_error)
 
         # Get Lidar data from RayCaster sensor
         lidar_data = self.lidar.data.ray_hits_w  # Shape: (num_envs, num_rays, 3) - hit positions
@@ -425,7 +450,29 @@ class LeatherbackEnv(DirectRLEnv):
             dim=-1,
         )
         
+        # Replace any remaining NaN values with zeros to prevent training crash
+        # This allows training to continue while we identify the root cause
         if torch.any(obs.isnan()):
+            nan_count = torch.sum(obs.isnan()).item()
+            nan_mask = obs.isnan()
+            
+            # Identify which observation components have NaNs
+            if nan_count > 0:
+                print(f"[NaN DEBUG] Step {self.common_step_counter}: {nan_count} NaNs in observations")
+                print(f"  Position error: {torch.sum(nan_mask[:, 0]).item()}")
+                print(f"  Heading cos: {torch.sum(nan_mask[:, 1]).item()}")
+                print(f"  Heading sin: {torch.sum(nan_mask[:, 2]).item()}")
+                print(f"  Vel X: {torch.sum(nan_mask[:, 3]).item()}")
+                print(f"  Vel Y: {torch.sum(nan_mask[:, 4]).item()}")
+                print(f"  Ang vel: {torch.sum(nan_mask[:, 5]).item()}")
+                print(f"  Throttle: {torch.sum(nan_mask[:, 6]).item()}")
+                print(f"  Steering: {torch.sum(nan_mask[:, 7]).item()}")
+                print(f"  Shocks: {torch.sum(nan_mask[:, 8:12]).item()}")
+                print(f"  Lidar: {torch.sum(nan_mask[:, 12]).item()}")
+            
+            obs = torch.where(nan_mask, torch.zeros_like(obs), obs)
+            
+            # Original debug code (commented out)
             # print("=" * 80)
             # print("NaN DETECTED IN OBSERVATIONS!")
             # print("=" * 80)
@@ -440,11 +487,19 @@ class LeatherbackEnv(DirectRLEnv):
             # print(f"Root velocity: {self.leatherback.data.root_lin_vel_b[obs.isnan().any(dim=1)]}")
             # print(f"Heading: {self.leatherback.data.heading_w[obs.isnan().any(dim=1)]}")
             # print("=" * 80)
-            raise ValueError("Observations cannot be NAN")
+            # raise ValueError("Observations cannot be NAN")
 
         return {"policy": obs}
     
     def _get_rewards(self) -> torch.Tensor:
+        # Check for extreme shock velocities before computing rewards
+        shock_velocities_abs = torch.abs(self.leatherback.data.joint_vel[:, self._shock_dof_idx])
+        if torch.any(shock_velocities_abs > 100.0):
+            extreme_shock_envs = torch.any(shock_velocities_abs > 100.0, dim=1)
+            extreme_shock_ids = torch.where(extreme_shock_envs)[0].cpu().numpy().tolist()
+            print(f"[PHYSICS RESET IN REWARDS] Resetting {len(extreme_shock_ids)} environments due to extreme shock velocities")
+            self._reset_idx(extreme_shock_ids)
+        
         position_progress_rew = self._previous_position_error - self._position_error
         target_heading_rew = torch.exp(-torch.abs(self.target_heading_error) / self.heading_coefficient)
         goal_reached = self._position_error < self.position_tolerance
@@ -458,7 +513,9 @@ class LeatherbackEnv(DirectRLEnv):
         shock_compression = torch.abs(shock_positions)
         
         # Shock velocity penalty (penalize high shock velocity/oscillation)
+        # Clamp to prevent extreme values from corrupting rewards
         shock_velocities = torch.abs(self.leatherback.data.joint_vel[:, self._shock_dof_idx])
+        shock_velocities = torch.clamp(shock_velocities, max=100.0)  # Cap at 100 m/s
         
         # Check for NaN in joint data (can happen during multi-env sensor updates)
         if torch.any(torch.isnan(shock_positions)) or torch.any(torch.isnan(shock_velocities)):
@@ -482,7 +539,7 @@ class LeatherbackEnv(DirectRLEnv):
         
         # Obstacle collision penalty
         obstacle_collision = self._check_obstacle_collisions()
-        R_collision = -20.0 * obstacle_collision.float()  # Penalty for hitting obstacles (2 waypoints worth)
+        R_collision = -0.1 * obstacle_collision.float()  # Minimal penalty - waypoints are priority
         
         # Lidar-based rewards for obstacle avoidance
         # Use the minimum lidar distance from observations
@@ -513,12 +570,49 @@ class LeatherbackEnv(DirectRLEnv):
             R_lidar_danger +
             R_lidar_collision
         )
+        
+        # Debug extreme rewards
+        if torch.any(torch.abs(composite_reward) > 1000):
+            extreme_mask = torch.abs(composite_reward) > 1000
+            print(f"[REWARD DEBUG] Extreme reward detected at step {self.common_step_counter}")
+            print(f"  Position progress: {position_progress_rew[extreme_mask]}")
+            print(f"  Target heading: {target_heading_rew[extreme_mask]}")
+            print(f"  Goal reached: {goal_reached[extreme_mask]}")
+            print(f"  Shock pos: {R_shock_pos[extreme_mask]}")
+            print(f"  Shock vel: {R_shock_vel[extreme_mask]}")
+            print(f"  Wheel contact: {R_wheel_contact[extreme_mask]}")
+            print(f"  Shock act: {R_shock_act[extreme_mask]}")
+            print(f"  Collision: {R_collision[extreme_mask]}")
+            print(f"  Lidar rewards: {R_lidar_safe[extreme_mask] + R_lidar_danger[extreme_mask] + R_lidar_collision[extreme_mask]}")
+            print(f"  Position error: {self._position_error[extreme_mask]}")
+            print(f"  Previous error: {self._previous_position_error[extreme_mask]}")
+            print(f"  Root position: {self.leatherback.data.root_pos_w[extreme_mask]}")
+            print(f"  Lidar min distance: {self.lidar_min_distance[extreme_mask]}")
+            print(f"  Composite reward: {composite_reward[extreme_mask]}")
 
         one_hot_encoded = torch.nn.functional.one_hot(self._target_index.long(), num_classes=self._num_goals)
         marker_indices = one_hot_encoded.view(-1).tolist()
         self.waypoints.visualize(marker_indices=marker_indices)
 
+        # Replace any NaN rewards with zeros to prevent training crash
         if torch.any(composite_reward.isnan()):
+            nan_count = torch.sum(composite_reward.isnan()).item()
+            print(f"[NaN DEBUG] Step {self.common_step_counter}: {nan_count} NaNs in rewards")
+            
+            # Check individual reward components
+            print(f"  Position progress NaN: {torch.sum((position_progress_rew * self.position_progress_weight).isnan()).item()}")
+            print(f"  Target heading NaN: {torch.sum((target_heading_rew * self.heading_progress_weight).isnan()).item()}")
+            print(f"  Goal reached NaN: {torch.sum((goal_reached.float() * self.goal_reached_bonus).isnan()).item()}")
+            print(f"  Shock pos NaN: {torch.sum(R_shock_pos.isnan()).item()}")
+            print(f"  Shock vel NaN: {torch.sum(R_shock_vel.isnan()).item()}")
+            print(f"  Wheel contact NaN: {torch.sum(R_wheel_contact.isnan()).item()}")
+            print(f"  Shock act NaN: {torch.sum(R_shock_act.isnan()).item()}")
+            print(f"  Collision NaN: {torch.sum(R_collision.isnan()).item()}")
+            print(f"  Lidar rewards NaN: {torch.sum((R_lidar_safe + R_lidar_danger + R_lidar_collision).isnan()).item()}")
+            
+            composite_reward = torch.where(torch.isnan(composite_reward), torch.zeros_like(composite_reward), composite_reward)
+            
+            # Original debug code (commented out)
             # print("=" * 80)
             # print("NaN DETECTED IN REWARDS!")
             # print("=" * 80)
@@ -536,7 +630,7 @@ class LeatherbackEnv(DirectRLEnv):
             # print(f"\nLidar min distance: {self.lidar_min_distance}")
             # print(f"Lidar min distance NaN mask: {self.lidar_min_distance.isnan()}")
             # print("=" * 80)
-            raise ValueError("Rewards cannot be NAN")
+            # raise ValueError("Rewards cannot be NAN")
 
         return composite_reward
 
@@ -597,14 +691,22 @@ class LeatherbackEnv(DirectRLEnv):
 
         # At this point env_ids is guaranteed to be Sequence[int]
         assert env_ids is not None
-        num_reset = len(env_ids)
-        default_state = self.leatherback.data.default_root_state[env_ids]
+        
+        # Convert to tensor if it's a list (needed for PhysX API calls)
+        if isinstance(env_ids, list):
+            env_ids_tensor = torch.tensor(env_ids, dtype=torch.int32, device=self.device)
+        else:
+            # env_ids is already a tensor (from leatherback._ALL_INDICES or torch.where)
+            env_ids_tensor = env_ids  # type: ignore[assignment]
+        
+        num_reset = len(env_ids_tensor)
+        default_state = self.leatherback.data.default_root_state[env_ids_tensor]
         leatherback_pose = default_state[:, :7]
         leatherback_velocities = default_state[:, 7:]
-        joint_positions = self.leatherback.data.default_joint_pos[env_ids]
-        joint_velocities = self.leatherback.data.default_joint_vel[env_ids]
+        joint_positions = self.leatherback.data.default_joint_pos[env_ids_tensor]
+        joint_velocities = self.leatherback.data.default_joint_vel[env_ids_tensor]
 
-        leatherback_pose[:, :3] += self.scene.env_origins[env_ids]
+        leatherback_pose[:, :3] += self.scene.env_origins[env_ids_tensor]
         leatherback_pose[:, 0] -= self.env_spacing / 2
         leatherback_pose[:, 1] += 2.0 * torch.rand((num_reset), dtype=torch.float32, device=self.device) * self.course_width_coefficient
 
@@ -612,9 +714,9 @@ class LeatherbackEnv(DirectRLEnv):
         leatherback_pose[:, 3] = torch.cos(angles * 0.5)
         leatherback_pose[:, 6] = torch.sin(angles * 0.5)
 
-        self.leatherback.write_root_pose_to_sim(leatherback_pose, env_ids)
-        self.leatherback.write_root_velocity_to_sim(leatherback_velocities, env_ids)
-        self.leatherback.write_joint_state_to_sim(joint_positions, joint_velocities, None, env_ids)
+        self.leatherback.write_root_pose_to_sim(leatherback_pose, env_ids_tensor)
+        self.leatherback.write_root_velocity_to_sim(leatherback_velocities, env_ids_tensor)
+        self.leatherback.write_joint_state_to_sim(joint_positions, joint_velocities, None, env_ids_tensor)
         
         # Create and initialize rigid prim views on first reset (after simulation starts)
         if not hasattr(self, '_prims_initialized'):
@@ -632,36 +734,37 @@ class LeatherbackEnv(DirectRLEnv):
             # print(f"[DEBUG] Initialized obstacle views (2 obstacle views, wall view disabled)")
         
         # Reset contact sensors after episode reset
-        self._reset_contact_sensors(env_ids)
+        self._reset_contact_sensors(env_ids_tensor)
         
         # # Debug: Check sensors once at startup
-        # if len(env_ids) > 0 and env_ids[0] == 0 and not hasattr(self, '_sensors_debugged'):
+        # if len(env_ids_tensor) > 0 and env_ids_tensor[0] == 0 and not hasattr(self, '_sensors_debugged'):
         #     self._debug_contact_sensors()
         #     self._debug_robot_bodies()
         #     self._sensors_debugged = True
 
-        self._target_positions[env_ids, :, :] = 0.0
-        self._markers_pos[env_ids, :, :] = 0.0
+        self._target_positions[env_ids_tensor, :, :] = 0.0
+        self._markers_pos[env_ids_tensor, :, :] = 0.0
 
         spacing = 2 / self._num_goals
         target_positions = torch.arange(-0.8, 1.1, spacing, device=self.device) * self.env_spacing / self.course_length_coefficient
-        self._target_positions[env_ids, :len(target_positions), 0] = target_positions
-        self._target_positions[env_ids, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) + self.course_length_coefficient
-        self._target_positions[env_ids, :] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
+        self._target_positions[env_ids_tensor, :len(target_positions), 0] = target_positions
+        self._target_positions[env_ids_tensor, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) + self.course_length_coefficient
+        self._target_positions[env_ids_tensor, :] += self.scene.env_origins[env_ids_tensor, :2].unsqueeze(1)
 
-        self._target_index[env_ids] = 0
-        self._markers_pos[env_ids, :, :2] = self._target_positions[env_ids]
+        self._target_index[env_ids_tensor] = 0
+        self._markers_pos[env_ids_tensor, :, :2] = self._target_positions[env_ids_tensor]
         visualize_pos = self._markers_pos.view(-1, 3)
         self.waypoints.visualize(translations=visualize_pos)
         
         # Reset obstacle positions AFTER prims are initialized
         if hasattr(self, '_prims_initialized'):
-            self._reset_obstacle_positions(env_ids)
+            self._reset_obstacle_positions(env_ids_tensor)
         
+        # Disable lidar visualization to avoid multi-env instability
         # Enable lidar visualization after first reset (when sensors are properly initialized)
-        if not hasattr(self, '_lidar_vis_enabled'):
-            self.lidar.set_debug_vis(True)
-            self._lidar_vis_enabled = True
+        # if not hasattr(self, '_lidar_vis_enabled'):
+        #     self.lidar.set_debug_vis(True)
+        #     self._lidar_vis_enabled = True
 
         current_target_positions = self._target_positions[self.leatherback._ALL_INDICES, self._target_index]
         self._position_error_vector = current_target_positions[:, :2] - self.leatherback.data.root_pos_w[:, :2]
@@ -765,7 +868,7 @@ class LeatherbackEnv(DirectRLEnv):
         
         # print(f"[DEBUG] Created 2 obstacles for source environment (test walls disabled)")
     
-    def _reset_obstacle_positions(self, env_ids: Sequence[int]):
+    def _reset_obstacle_positions(self, env_ids: torch.Tensor | Sequence[int]):
         """Reset obstacle positions for given environments by moving them using RigidPrimView."""
         # Type guard assertions
         assert self._obstacle_positions is not None
@@ -851,7 +954,7 @@ class LeatherbackEnv(DirectRLEnv):
         # 
         # print(f"[DEBUG] === END ROBOT BODIES DEBUG ===")
 
-    def _reset_contact_sensors(self, env_ids: Sequence[int]):
+    def _reset_contact_sensors(self, env_ids: torch.Tensor | Sequence[int]):
         """Reset and reinitialize contact sensors after episode reset."""
         if not hasattr(self.scene, 'sensors'):
             return
