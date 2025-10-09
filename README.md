@@ -95,6 +95,69 @@ Edit `agents/skrl_ppo_cfg.yaml` to modify:
 - Training hyperparameters
 - Rollout settings
 
+## Training History
+
+### [32,32] Layers
+
+- **Phase 1**: 20 second episode, implicit suspension, 10 waypoint, about 20 meters
+    - `2025-09-30_20-51-01_ppo_torch`
+    - REWARD NORMALIZES so 100 is max here
+
+- **Phase 2 (BAD)**: 40 second episode, implicit suspension, 6 waypoints, about 50 meters
+    - `2025-10-01_10-40-21_ppo_torch`
+    - REWARD NORMALIZES so 70 is max here
+
+- **Phase 2a (GOOD/KEPT)**: 40 second episode, implicit suspension, 7 waypoints, 20 meters
+    - `2025-10-01_13-59-46_ppo_torch`
+    - REWARD NORMALIZES so 70 is max here
+
+- ~~**Phase 3**: 40 second episode, 35m, 7 waypoints, implicit suspension~~
+    - ~~`2025-10-01_16-01-45_ppo_torch`~~
+    - ~~REWARD NORMALIZES so 70 is max here~~
+
+- ~~**Phase 3a**: 40 second episode, 35m, 7 waypoints, implicit suspension (New YAML)~~
+    - ~~`2025-10-01_18-32-41_ppo_torch`~~
+    - ~~REWARD NORMALIZES so 70 is max here~~
+    - ~~NEW YAML~~
+
+- **Phase 3b**: 40 second episode, 35m, 10 waypoints, implicit suspension (OG YAML)
+    - `2025-10-01_19-20-50_ppo_torch`
+    - REWARD NORMALIZES so 100 is max here
+    - OG YAML configuration used
+
+- **Phase 3b.1** (continuation of 3b but longer episodes): 80 second episode, 35m, 10 waypoints, implicit suspension
+    - `2025-10-01_20-17-01_ppo_torch`
+    - REWARD NORMALIZES so 100 is max here
+
+### [128,128] Layers
+
+- **Phase 1**: 20 second episode, implicit suspension, 10 waypoint, about 20 meters
+    - `2025-10-01_21-28-34_ppo_torch`
+    - REWARD NORMALIZES so 100 is max here
+
+- **Phase 1a** (64 envs continuation): 20 second episode, implicit suspension, 10 waypoint, about 20 meters
+    - `2025-10-01_22-23-21_ppo_torch`
+    - REWARD NORMALIZES so 100 is max here
+
+- **Phase 2**: 40 second episode, implicit suspension, 7 waypoints, 20 meters
+    - REWARD NORMALIZES so 70 is max here
+
+- **Phase 3**: 80 second episode, 35m, 10 waypoints, implicit suspension
+    - REWARD NORMALIZES so 100 is max here
+
+### [128,128] Layers with Suspension
+
+- **Phase 1**: 20 second episode, 10 waypoint, about 20 meters
+    - `2025-10-01_23-52-12_ppo_torch`
+    - REWARD NORMALIZES so 100 is max here
+
+- **Phase 2**: 40 second episode, 7 waypoints, 20 meters
+    - `2025-10-02_11-12-47_ppo_torch`
+    - REWARD NORMALIZES so 70 is max here
+
+- **Phase 3**: 20 second episode, 10 waypoint, 20 meters, 1D planar LiDAR with 30–60 rays, ±90° FOV, Obstacles: 3–6 randomized per episode, Reset: on collision.
+    - REWARD NORMALIZES so 100 is max here
+
 ## License
 
 BSD-3-Clause License (consistent with Isaac Lab)
