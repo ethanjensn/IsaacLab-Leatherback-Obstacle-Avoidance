@@ -541,21 +541,21 @@ class LeatherbackEnv(DirectRLEnv):
         obstacle_collision = self._check_obstacle_collisions()
         R_collision = -0.1 * obstacle_collision.float()  # Minimal penalty - waypoints are priority
         
-        # Lidar-based rewards for obstacle avoidance
-        # Use the minimum lidar distance from observations
+        # Directional progress - reward moving toward waypoint, not just facing it
+        waypoint_direction = self._position_error_vector / (self._position_error.unsqueeze(1) + 1e-6)
+        velocity_toward_waypoint = torch.sum(self.leatherback.data.root_lin_vel_b[:, :2] * waypoint_direction, dim=-1)
+        R_directional_progress = 0.5 * torch.clamp(velocity_toward_waypoint, min=-1.0, max=2.0)
+        
+        # Smooth distance-based lidar penalty (stronger as robot gets closer)
+        # Only penalize when within 3m, exponentially stronger as distance decreases
         min_lidar_distance = self.lidar_min_distance  # Shape: (num_envs,)
-        
-        # Safe distance reward - encourage maintaining distance from obstacles
-        safe_distance_mask = min_lidar_distance > self.lidar_safe_distance
-        R_lidar_safe = self.lidar_safe_reward * safe_distance_mask.float()
-        
-        # Danger zone penalty - penalize getting too close to obstacles
-        danger_zone_mask = (min_lidar_distance < self.lidar_danger_distance) & (min_lidar_distance > 0.1)
-        R_lidar_danger = self.lidar_danger_penalty * danger_zone_mask.float()
-        
-        # Collision penalty - large penalty for actual collision
-        collision_mask = min_lidar_distance < 0.1  # Very close = collision
-        R_lidar_collision = self.lidar_collision_penalty * collision_mask.float()
+        lidar_penalty_mask = min_lidar_distance < 3.0
+        lidar_distance_clamped = torch.clamp(min_lidar_distance, min=0.1, max=3.0)
+        R_lidar_smooth = torch.where(
+            lidar_penalty_mask,
+            -0.2 * torch.exp(-lidar_distance_clamped / 1.5),  # Exponential penalty
+            torch.zeros_like(min_lidar_distance)
+        )
 
         composite_reward = (
             position_progress_rew * self.position_progress_weight +
@@ -566,9 +566,8 @@ class LeatherbackEnv(DirectRLEnv):
             R_wheel_contact +
             R_shock_act +
             R_collision +
-            R_lidar_safe +
-            R_lidar_danger +
-            R_lidar_collision
+            R_directional_progress +
+            R_lidar_smooth
         )
         
         # Debug extreme rewards
@@ -583,7 +582,7 @@ class LeatherbackEnv(DirectRLEnv):
             print(f"  Wheel contact: {R_wheel_contact[extreme_mask]}")
             print(f"  Shock act: {R_shock_act[extreme_mask]}")
             print(f"  Collision: {R_collision[extreme_mask]}")
-            print(f"  Lidar rewards: {R_lidar_safe[extreme_mask] + R_lidar_danger[extreme_mask] + R_lidar_collision[extreme_mask]}")
+            print(f"  Lidar rewards: {R_lidar_smooth[extreme_mask]}")
             print(f"  Position error: {self._position_error[extreme_mask]}")
             print(f"  Previous error: {self._previous_position_error[extreme_mask]}")
             print(f"  Root position: {self.leatherback.data.root_pos_w[extreme_mask]}")
@@ -608,7 +607,7 @@ class LeatherbackEnv(DirectRLEnv):
             print(f"  Wheel contact NaN: {torch.sum(R_wheel_contact.isnan()).item()}")
             print(f"  Shock act NaN: {torch.sum(R_shock_act.isnan()).item()}")
             print(f"  Collision NaN: {torch.sum(R_collision.isnan()).item()}")
-            print(f"  Lidar rewards NaN: {torch.sum((R_lidar_safe + R_lidar_danger + R_lidar_collision).isnan()).item()}")
+            print(f"  Lidar rewards NaN: {torch.sum(R_lidar_smooth.isnan()).item()}")
             
             composite_reward = torch.where(torch.isnan(composite_reward), torch.zeros_like(composite_reward), composite_reward)
             
@@ -747,7 +746,11 @@ class LeatherbackEnv(DirectRLEnv):
 
         spacing = 2 / self._num_goals
         target_positions = torch.arange(-0.8, 1.1, spacing, device=self.device) * self.env_spacing / self.course_length_coefficient
-        self._target_positions[env_ids_tensor, :len(target_positions), 0] = target_positions
+        
+        # Add X randomization to make waypoints less predictable
+        x_positions = target_positions.unsqueeze(0) + torch.rand((num_reset, self._num_goals), device=self.device) * 2.0 - 1.0
+        self._target_positions[env_ids_tensor, :len(target_positions), 0] = x_positions
+        
         self._target_positions[env_ids_tensor, :, 1] = torch.rand((num_reset, self._num_goals), dtype=torch.float32, device=self.device) + self.course_length_coefficient
         self._target_positions[env_ids_tensor, :] += self.scene.env_origins[env_ids_tensor, :2].unsqueeze(1)
 
