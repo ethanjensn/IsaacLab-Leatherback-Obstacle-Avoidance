@@ -162,7 +162,7 @@ class LeatherbackEnvCfg(DirectRLEnvCfg):
     )
     
     # Obstacle configuration
-    num_obstacles_per_env = 3
+    num_obstacles_per_env = (3, 5)  # Random 3-5 obstacles per environment
     obstacle_width_range = (0.5, 2.0)  # Width across course (m)
     obstacle_height_range = (1.0, 2.0)  # Height (m)
     obstacle_depth_range = (0.2, 0.6)  # Depth along course (m)
@@ -234,6 +234,9 @@ class LeatherbackEnv(DirectRLEnv):
         self.lidar_safe_reward = 0.005  # Very small bonus for safe distance
         self.lidar_danger_penalty = -0.01  # Very small penalty - gentle discouragement only
         self.lidar_collision_penalty = -0.02  # Small penalty - won't block waypoint reaching
+        
+        # Obstacle-waypoint separation
+        self.min_obstacle_waypoint_distance = 2.5  # Minimum 2.5m between obstacles and waypoints
 
     def _setup_scene(self):
         # Add Physics Scene for Lidar to work (required by Isaac Sim 5.0.0)
@@ -284,10 +287,10 @@ class LeatherbackEnv(DirectRLEnv):
 
     def _spawn_obstacles(self):
         """Spawn obstacles for all environments."""
-        # Initialize obstacle tensors if not already done
+        # Initialize obstacle tensors if not already done (max 5 obstacles)
         if not hasattr(self, '_obstacle_sizes') or self._obstacle_sizes is None:
-            self._obstacle_positions = torch.zeros((self.num_envs, self.cfg.num_obstacles_per_env, 3), device=self.device, dtype=torch.float32)
-            self._obstacle_sizes = torch.zeros((self.num_envs, self.cfg.num_obstacles_per_env, 3), device=self.device, dtype=torch.float32)
+            self._obstacle_positions = torch.zeros((self.num_envs, 5, 3), device=self.device, dtype=torch.float32)
+            self._obstacle_sizes = torch.zeros((self.num_envs, 5, 3), device=self.device, dtype=torch.float32)
         
         # Type guard assertions
         assert self._obstacle_positions is not None
@@ -295,7 +298,9 @@ class LeatherbackEnv(DirectRLEnv):
         
         for env_idx in range(self.num_envs):
             env_origin = self.scene.env_origins[env_idx]
-            for obs_idx in range(self.cfg.num_obstacles_per_env):
+            # Randomly choose 3-5 obstacles for this environment
+            num_obstacles = torch.randint(3, 6, (1,), device=self.device).item()
+            for obs_idx in range(int(num_obstacles)):
                 prim_path = f"/World/envs/env_{env_idx}/Obstacle_{obs_idx}"
                 
                 # Randomize obstacle size
@@ -553,7 +558,7 @@ class LeatherbackEnv(DirectRLEnv):
         lidar_distance_clamped = torch.clamp(min_lidar_distance, min=0.1, max=3.0)
         R_lidar_smooth = torch.where(
             lidar_penalty_mask,
-            -0.2 * torch.exp(-lidar_distance_clamped / 1.5),  # Exponential penalty
+            -1.0 * torch.exp(-lidar_distance_clamped / 1.5),  # Exponential penalty - 5x stronger
             torch.zeros_like(min_lidar_distance)
         )
 
@@ -720,17 +725,14 @@ class LeatherbackEnv(DirectRLEnv):
         # Create and initialize rigid prim views on first reset (after simulation starts)
         if not hasattr(self, '_prims_initialized'):
             from isaacsim.core.prims import RigidPrim
-            # Create views for all obstacles using regex patterns
-            self._obstacle_0_view = RigidPrim("/World/envs/env_.*/TestObstacle_0", reset_xform_properties=False)
-            self._obstacle_1_view = RigidPrim("/World/envs/env_.*/TestObstacle_1", reset_xform_properties=False)
-            # Wall view commented out - no test walls
-            # self._wall_view = RigidPrim("/World/envs/env_.*/TestWall", reset_xform_properties=False)
-            # Initialize views
-            self._obstacle_0_view.initialize()
-            self._obstacle_1_view.initialize()
-            # self._wall_view.initialize()
+            # Create views for all 5 obstacles (all created in source env)
+            self._obstacle_views = []
+            for i in range(5):
+                view = RigidPrim(f"/World/envs/env_.*/TestObstacle_{i}", reset_xform_properties=False)
+                view.initialize()
+                self._obstacle_views.append(view)
             self._prims_initialized = True
-            # print(f"[DEBUG] Initialized obstacle views (2 obstacle views, wall view disabled)")
+            # print(f"[DEBUG] Initialized obstacle views (5 obstacle views)")
         
         # Reset contact sensors after episode reset
         self._reset_contact_sensors(env_ids_tensor)
@@ -844,32 +846,31 @@ class LeatherbackEnv(DirectRLEnv):
 
 
     def _create_obstacles_for_source_env(self):
-        """Create obstacles only for the source environment (env_0) at scene setup time."""
-        # print(f"[DEBUG] Creating obstacles for source environment only (will be cloned)...")
+        """Create obstacle templates in source environment - actual obstacles created during reset."""
+        # print(f"[DEBUG] Creating obstacle templates for source environment...")
         
         if self._obstacle_sizes is None:
-            self._obstacle_sizes = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=torch.float32)
+            self._obstacle_sizes = torch.zeros((self.num_envs, 5, 3), device=self.device, dtype=torch.float32)
         if self._obstacle_positions is None:
-            self._obstacle_positions = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=torch.float32)
+            self._obstacle_positions = torch.zeros((self.num_envs, 5, 3), device=self.device, dtype=torch.float32)
         
+        # Create template obstacles (hidden at origin) - will be positioned during reset
         # Only create obstacles for env_0 (source environment)
         env_idx = 0
-        for obs_idx in range(2):
+        for obs_idx in range(5):  # Create templates for max 5 obstacles
             prim_path = f"/World/envs/env_{env_idx}/TestObstacle_{obs_idx}"
-            width = torch.rand(1, device=self.device) * (self.cfg.obstacle_width_range[1] - self.cfg.obstacle_width_range[0]) + self.cfg.obstacle_width_range[0]
-            height = torch.rand(1, device=self.device) * (self.cfg.obstacle_height_range[1] - self.cfg.obstacle_height_range[0]) + self.cfg.obstacle_height_range[0]
-            depth = torch.rand(1, device=self.device) * (self.cfg.obstacle_depth_range[1] - self.cfg.obstacle_depth_range[0]) + self.cfg.obstacle_depth_range[0]
-            self._obstacle_sizes[env_idx, obs_idx] = torch.tensor([width.item(), depth.item(), height.item()], device=self.device)
+            # Use default size for template - will be randomized during reset
             obstacle_cfg = CuboidCfg(
-                size=(width.item(), depth.item(), height.item()),
+                size=(1.0, 0.4, 1.5),  # Default template size
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=False, disable_gravity=True, max_linear_velocity=0.0, max_angular_velocity=0.0),
                 mass_props=sim_utils.MassPropertiesCfg(mass=10000.0),
                 collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True, contact_offset=0.02, rest_offset=0.0),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0) if obs_idx == 0 else (0.0, 0.0, 1.0)),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.2, 0.2)),  # Red color
             )
+            # Place template at origin - will be repositioned during reset
             obstacle_cfg.func(prim_path, obstacle_cfg, translation=(0.0, 0.0, 0.55))
         
-        # print(f"[DEBUG] Created 2 obstacles for source environment (test walls disabled)")
+        # print(f"[DEBUG] Created 5 obstacle templates for source environment")
     
     def _reset_obstacle_positions(self, env_ids: torch.Tensor | Sequence[int]):
         """Reset obstacle positions for given environments by moving them using RigidPrimView."""
@@ -885,21 +886,65 @@ class LeatherbackEnv(DirectRLEnv):
         # Reset obstacle positions to zero for resetting environments
         self._obstacle_positions[env_ids, :, :] = 0.0
         
-        # Position obstacles along the course
-        for obs_idx in range(2):  # 2 obstacles per environment
-            # X position: random position along course
-            x_position = torch.rand((num_reset,), device=self.device) * 1.9 - 0.8
-            x_position = x_position * self.env_spacing / self.course_length_coefficient
-            self._obstacle_positions[env_ids, obs_idx, 0] = x_position
+        # Position obstacles along the course with waypoint and obstacle collision avoidance
+        for env_i, env_id in enumerate(env_ids):
+            # Randomly choose 3-5 obstacles for this reset
+            num_obstacles = torch.randint(3, 6, (1,), device=self.device).item()
             
-            # Y position: random across course width
-            y_position = torch.rand((num_reset,), device=self.device) * self.course_width_coefficient * 2 + 1.0
-            self._obstacle_positions[env_ids, obs_idx, 1] = y_position
+            # Get waypoints for this environment
+            env_waypoints = self._target_positions[env_id, :, :2]  # Shape: (num_goals, 2)
             
-            # Z position: at Lidar height (0.55m above ground)
-            self._obstacle_positions[env_ids, obs_idx, 2] = 0.55
+            for obs_idx in range(int(num_obstacles)):
+                # Try up to 10 times to find a valid position
+                valid_position_found = False
+                for attempt in range(10):
+                    # X position: random position along course
+                    x_pos = (torch.rand(1, device=self.device) * 1.9 - 0.8) * self.env_spacing / self.course_length_coefficient
+                    
+                    # Y position: random across course width
+                    y_pos = torch.rand(1, device=self.device) * self.course_width_coefficient * 2 + 1.0
+                    
+                    # Create obstacle position tensor
+                    obstacle_pos = torch.tensor([x_pos.item(), y_pos.item()], device=self.device)
+                    
+                    # Check distance to all waypoints
+                    distances_to_waypoints = torch.norm(env_waypoints - obstacle_pos.unsqueeze(0), dim=-1)
+                    min_waypoint_distance = torch.min(distances_to_waypoints)
+                    
+                    # Check distance to previously placed obstacles in this environment
+                    min_obstacle_distance = float('inf')
+                    if obs_idx > 0:
+                        for prev_obs_idx in range(obs_idx):
+                            prev_obstacle_pos = self._obstacle_positions[env_id, prev_obs_idx, :2]
+                            # Only check if this obstacle was actually placed (not at origin)
+                            if not torch.allclose(prev_obstacle_pos, torch.tensor([0.0, 0.0], device=self.device), atol=1e-6):
+                                distance_to_prev = torch.norm(obstacle_pos - prev_obstacle_pos)
+                                min_obstacle_distance = min(min_obstacle_distance, distance_to_prev.item())
+                    
+                    # If far enough from all waypoints AND other obstacles, use this position
+                    if (min_waypoint_distance > self.min_obstacle_waypoint_distance and 
+                        min_obstacle_distance > self.min_obstacle_waypoint_distance):
+                        valid_position_found = True
+                        self._obstacle_positions[env_id, obs_idx, 0] = x_pos.item()
+                        self._obstacle_positions[env_id, obs_idx, 1] = y_pos.item()
+                        self._obstacle_positions[env_id, obs_idx, 2] = 0.55  # Lidar height
+                        break
+                
+                # If no valid position found, use safe fallback
+                if not valid_position_found:
+                    self._obstacle_positions[env_id, obs_idx, 0] = -0.8 * self.env_spacing / self.course_length_coefficient
+                    self._obstacle_positions[env_id, obs_idx, 1] = self.course_width_coefficient * (3.0 + obs_idx)
+                    self._obstacle_positions[env_id, obs_idx, 2] = 0.55
+            
+            # Move unused obstacles extremely far away (so lidar won't detect them and no env can reach them)
+            # With 1024 envs at 32m spacing = ~1km grid, 5000m is safely beyond any environment
+            for obs_idx in range(int(num_obstacles), 5):
+                # Place unused obstacles 5km away (world coordinates, will be offset by env origin later)
+                self._obstacle_positions[env_id, obs_idx, 0] = 5000.0  # 5km away
+                self._obstacle_positions[env_id, obs_idx, 1] = 5000.0  # 5km away
+                self._obstacle_positions[env_id, obs_idx, 2] = 0.55  # Same height
         
-        # Add environment origins
+        # Add environment origins to all obstacles
         self._obstacle_positions[env_ids, :, :2] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
         
         # Quaternion for 90 degree rotation around Z (to make obstacles horizontal)
@@ -912,16 +957,12 @@ class LeatherbackEnv(DirectRLEnv):
         else:
             env_ids_tensor = env_ids
         
-        # Move obstacles using RigidPrimView - set_world_poses expects tensors
-        # Obstacle 0
-        obs0_positions = self._obstacle_positions[env_ids, 0, :]  # Shape: (num_reset, 3)
-        obs0_orientations = quat_90z.unsqueeze(0).repeat(num_reset, 1)  # Shape: (num_reset, 4)
-        self._obstacle_0_view.set_world_poses(obs0_positions, obs0_orientations, indices=env_ids_tensor)
-        
-        # Obstacle 1
-        obs1_positions = self._obstacle_positions[env_ids, 1, :]  # Shape: (num_reset, 3)
-        obs1_orientations = quat_90z.unsqueeze(0).repeat(num_reset, 1)  # Shape: (num_reset, 4)
-        self._obstacle_1_view.set_world_poses(obs1_positions, obs1_orientations, indices=env_ids_tensor)
+        # Move all obstacles (up to 5) using views
+        for obs_idx in range(5):
+            if obs_idx < len(self._obstacle_views):
+                obs_positions = self._obstacle_positions[env_ids, obs_idx, :]
+                obs_orientations = quat_90z.unsqueeze(0).repeat(num_reset, 1)
+                self._obstacle_views[obs_idx].set_world_poses(obs_positions, obs_orientations, indices=env_ids_tensor)
         
         # Test walls commented out - no walls to reset
         # robot_positions = self.leatherback.data.root_pos_w[env_ids]  # Shape: (num_reset, 3)
