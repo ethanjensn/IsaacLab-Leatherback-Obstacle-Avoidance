@@ -163,10 +163,10 @@ class LeatherbackEnvCfg(DirectRLEnvCfg):
     
     # Two-wall gap navigation configuration
     num_obstacles_per_env = 2  # Exactly 2 walls per environment (left + right)
-    wall_length = 1.5  # Wall length perpendicular to path (m)
+    wall_length = 4.0  # Wall length perpendicular to path (m) - longer to prevent going around
     wall_depth = 0.25  # Wall thickness along path (m)
     wall_height = 1.75  # Wall height (m)
-    gap_size_range = (2.0, 3.0)  # Gap between walls (m) - robot is ~1.5m wide
+    gap_size_range = (1.8, 2.5)  # Gap between walls (m) - robot is ~1.5m wide
     obstacle_cfg: CuboidCfg = CuboidCfg(
         size=(wall_length, wall_depth, wall_height),  # Wall dimensions
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -710,93 +710,103 @@ class LeatherbackEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.leatherback._ALL_INDICES
         
-        num_reset = len(env_ids)
-        
-        # Reset obstacle positions to zero
-        self._obstacle_positions[env_ids, :, :] = 0.0
-        
-        # Store wall orientations for each environment
-        wall_orientations_storage = torch.zeros((num_reset, 4), device=self.device, dtype=torch.float32)
-        
-        # Place two walls with gap for each environment
-        for env_i, env_id in enumerate(env_ids):
-            # Pick random pair of consecutive waypoints (e.g., waypoint 2 → waypoint 3)
-            waypoint_pair_idx = int(torch.randint(0, self._num_goals - 1, (1,), device=self.device).item())
-            
-            # Get the two waypoints in WORLD coordinates, then convert to LOCAL
-            waypoint_a_world = self._target_positions[env_id, waypoint_pair_idx, :2]
-            waypoint_b_world = self._target_positions[env_id, waypoint_pair_idx + 1, :2]
-            
-            # Convert to LOCAL coordinates (subtract env origin)
-            env_origin = self.scene.env_origins[env_id, :2]
-            waypoint_a = waypoint_a_world - env_origin
-            waypoint_b = waypoint_b_world - env_origin
-            
-            # Calculate midpoint between waypoints (in LOCAL coords)
-            midpoint = (waypoint_a + waypoint_b) / 2.0
-            
-            # Calculate direction vector from waypoint A to B (path direction)
-            direction = waypoint_b - waypoint_a
-            direction_length = torch.norm(direction)
-            if direction_length > 0:
-                direction_normalized = direction / direction_length
-            else:
-                direction_normalized = torch.tensor([1.0, 0.0], device=self.device)
-            
-            # Perpendicular vector (90 degrees rotation) - this is wall orientation
-            perpendicular = torch.tensor([-direction_normalized[1], direction_normalized[0]], device=self.device)
-            
-            # Calculate rotation angle for walls to align with perpendicular direction
-            # Wall should be aligned along perpendicular direction
-            angle = torch.atan2(perpendicular[1], perpendicular[0])
-            
-            # Convert to quaternion (rotation around Z axis)
-            half_angle = angle / 2.0
-            quat = torch.tensor([
-                torch.cos(half_angle).item(),  # w
-                0.0,  # x
-                0.0,  # y
-                torch.sin(half_angle).item()   # z
-            ], dtype=torch.float32, device=self.device)
-            wall_orientations_storage[env_i] = quat
-            
-            # Randomize gap size (1.8-2.5m)
-            gap_size = torch.rand(1, device=self.device) * (self.cfg.gap_size_range[1] - self.cfg.gap_size_range[0]) + self.cfg.gap_size_range[0]
-            half_gap = gap_size / 2.0
-            
-            # Place left wall (perpendicular offset from midpoint) - LOCAL coordinates
-            left_wall_pos_2d = midpoint - perpendicular * half_gap
-            self._obstacle_positions[env_id, 0, 0] = left_wall_pos_2d[0].item()
-            self._obstacle_positions[env_id, 0, 1] = left_wall_pos_2d[1].item()
-            self._obstacle_positions[env_id, 0, 2] = self.cfg.wall_height / 2.0  # Z = height/2
-            
-            # Place right wall (perpendicular offset from midpoint) - LOCAL coordinates
-            right_wall_pos_2d = midpoint + perpendicular * half_gap
-            self._obstacle_positions[env_id, 1, 0] = right_wall_pos_2d[0].item()
-            self._obstacle_positions[env_id, 1, 1] = right_wall_pos_2d[1].item()
-            self._obstacle_positions[env_id, 1, 2] = self.cfg.wall_height / 2.0  # Z = height/2
-        
-        # Add environment origins to wall positions (convert LOCAL to WORLD coordinates)
-        self._obstacle_positions[env_ids, :, :2] += self.scene.env_origins[env_ids, :2].unsqueeze(1)
-        
         # Convert env_ids to tensor if needed
         if not isinstance(env_ids, torch.Tensor):
             env_ids_tensor = torch.tensor(list(env_ids), dtype=torch.int32, device=self.device)
         else:
             env_ids_tensor = env_ids
         
-        # Move both walls using views (only 2 walls now)
-        # Both walls in the same environment have the same orientation (perpendicular to path)
-        for obs_idx in range(2):
-            if obs_idx < len(self._obstacle_views):
-                wall_positions = self._obstacle_positions[env_ids, obs_idx, :]
-                # Use calculated orientations for each environment
-                wall_orientations = wall_orientations_storage
-                self._obstacle_views[obs_idx].set_world_poses(wall_positions, wall_orientations, indices=env_ids_tensor)
+        num_reset = len(env_ids_tensor)
         
-        print(f"[GAP NAVIGATION] Reset {num_reset} environments: Walls placed between waypoints")
+        # Reset obstacle positions to zero
+        self._obstacle_positions[env_ids_tensor, :, :] = 0.0
+        
+        # BATCHED OPERATIONS: Process all environments at once
+        
+        # 1. Pick random waypoint pairs for all environments at once (shape: [num_reset])
+        waypoint_pair_indices = torch.randint(0, self._num_goals - 1, (num_reset,), device=self.device)
+        
+        # 2. Extract waypoints using advanced indexing (shape: [num_reset, 2])
+        waypoint_a_world = self._target_positions[env_ids_tensor, waypoint_pair_indices, :2]
+        waypoint_b_world = self._target_positions[env_ids_tensor, waypoint_pair_indices + 1, :2]
+        
+        # 3. Convert to LOCAL coordinates (subtract env origins)
+        env_origins = self.scene.env_origins[env_ids_tensor, :2]
+        waypoint_a = waypoint_a_world - env_origins
+        waypoint_b = waypoint_b_world - env_origins
+        
+        # 4. Calculate midpoints (shape: [num_reset, 2])
+        midpoints = (waypoint_a + waypoint_b) / 2.0
+        
+        # 5. Calculate direction vectors (shape: [num_reset, 2])
+        directions = waypoint_b - waypoint_a
+        direction_lengths = torch.norm(directions, dim=1, keepdim=True)
+        
+        # Handle zero-length vectors (fallback to [1, 0])
+        zero_length_mask = direction_lengths.squeeze() < 1e-6
+        direction_lengths = torch.where(direction_lengths < 1e-6, torch.ones_like(direction_lengths), direction_lengths)
+        directions_normalized = directions / direction_lengths
+        directions_normalized[zero_length_mask] = torch.tensor([1.0, 0.0], device=self.device)
+        
+        # 6. Calculate perpendicular vectors (90 degree rotation) - shape: [num_reset, 2]
+        perpendiculars = torch.stack([-directions_normalized[:, 1], directions_normalized[:, 0]], dim=1)
+        
+        # 7. Calculate rotation angles for quaternions (shape: [num_reset])
+        angles = torch.atan2(perpendiculars[:, 1], perpendiculars[:, 0])
+        half_angles = angles / 2.0
+        
+        # 8. Create quaternions (rotation around Z axis) - shape: [num_reset, 4]
+        wall_orientations = torch.zeros((num_reset, 4), device=self.device, dtype=torch.float32)
+        wall_orientations[:, 0] = torch.cos(half_angles)  # w
+        wall_orientations[:, 1] = 0.0  # x
+        wall_orientations[:, 2] = 0.0  # y
+        wall_orientations[:, 3] = torch.sin(half_angles)  # z
+        
+        # 9. Randomize gap sizes for all environments (shape: [num_reset, 1])
+        gap_sizes = torch.rand((num_reset, 1), device=self.device) * (self.cfg.gap_size_range[1] - self.cfg.gap_size_range[0]) + self.cfg.gap_size_range[0]
+        half_gaps = gap_sizes / 2.0
+        
+        # 10. Calculate wall offsets (shape: [num_reset, 1])
+        wall_half_length = self.cfg.wall_length / 2.0
+        wall_offsets = half_gaps + wall_half_length
+        
+        # 11. Calculate left and right wall positions (shape: [num_reset, 2])
+        left_wall_pos_2d = midpoints - perpendiculars * wall_offsets
+        right_wall_pos_2d = midpoints + perpendiculars * wall_offsets
+        
+        # 12. Assign wall positions (LOCAL coordinates)
+        self._obstacle_positions[env_ids_tensor, 0, :2] = left_wall_pos_2d
+        self._obstacle_positions[env_ids_tensor, 0, 2] = self.cfg.wall_height / 2.0
+        
+        self._obstacle_positions[env_ids_tensor, 1, :2] = right_wall_pos_2d
+        self._obstacle_positions[env_ids_tensor, 1, 2] = self.cfg.wall_height / 2.0
+        
+        # 13. Convert LOCAL to WORLD coordinates
+        self._obstacle_positions[env_ids_tensor, :, :2] += self.scene.env_origins[env_ids_tensor, :2].unsqueeze(1)
+        
+        # 14. Move both walls using BATCHED view updates (critical for 2048+ envs)
+        # Process environments in batches to avoid overwhelming USD stage updates
+        batch_size = 512
+        num_batches = (num_reset + batch_size - 1) // batch_size
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, num_reset)
+            batch_env_ids = env_ids_tensor[start_idx:end_idx]
+            
+            for obs_idx in range(2):
+                if obs_idx < len(self._obstacle_views):
+                    wall_positions = self._obstacle_positions[batch_env_ids, obs_idx, :]
+                    wall_orientations_batch = wall_orientations[start_idx:end_idx]
+                    self._obstacle_views[obs_idx].set_world_poses(
+                        wall_positions, 
+                        wall_orientations_batch, 
+                        indices=batch_env_ids
+                    )
+        
+        print(f"[GAP NAVIGATION] Reset {num_reset} environments in {num_batches} batches: Walls placed between waypoints")
         # Debug first environment
-        if 0 in env_ids or (isinstance(env_ids, torch.Tensor) and 0 in env_ids.cpu()):
+        if 0 in env_ids_tensor.cpu():
             print(f"  Env 0 left wall pos: {self._obstacle_positions[0, 0, :].cpu().numpy()}")
             print(f"  Env 0 right wall pos: {self._obstacle_positions[0, 1, :].cpu().numpy()}")
 
@@ -884,7 +894,4 @@ class LeatherbackEnv(DirectRLEnv):
         #     print(f"[DEBUG] WARNING: Scene has no sensors attribute!")
         # 
         # print(f"[DEBUG] === END CONTACT SENSORS DEBUG ===")
-
-
-
 
