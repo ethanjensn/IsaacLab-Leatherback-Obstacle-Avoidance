@@ -86,6 +86,7 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
     lidar = MultiMeshRayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Chassis",
         offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.3)),  # 0.3m up from chassis
+        update_period=0.1,  # Update every 0.1s (every 3 policy steps) for better GPU utilization
         pattern_cfg=patterns.LidarPatternCfg(
             channels=1,  # Single horizontal plane
             vertical_fov_range=(0.0, 0.0),  # 0 degrees vertical FOV
@@ -128,7 +129,7 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class LeatherbackEnvCfg(DirectRLEnvCfg):
-    decimation = 4
+    decimation = 2  # Reduced from 4 to run policy more frequently (better A100 utilization)
     episode_length_s = 40.0
     action_space = 2  # Only throttle + steering (STAGE 1 - was 6)
     observation_space = 9  # STAGE 1: removed 4 shock observations (was 13)
@@ -238,11 +239,7 @@ class LeatherbackEnv(DirectRLEnv):
         self.collision_penalty = -10.0        # Hard penalty for collision
 
     def _setup_scene(self):
-        # Add Physics Scene for Lidar to work (required by Isaac Sim 5.0.0)
-        import omni.kit.commands
-        import omni
-        stage = omni.usd.get_context().get_stage()
-        omni.kit.commands.execute('AddPhysicsSceneCommand', stage=stage, path='/World/PhysicsScene')
+        # Physics Scene is automatically created by Isaac Lab environment setup
         
         # Create a large ground plane without grid
         spawn_ground_plane(
@@ -595,18 +592,27 @@ class LeatherbackEnv(DirectRLEnv):
         self.leatherback.write_root_velocity_to_sim(leatherback_velocities, env_ids_tensor)
         self.leatherback.write_joint_state_to_sim(joint_positions, joint_velocities, None, env_ids_tensor)
         
-        # Create and initialize rigid prim views on first reset (after simulation starts)
+        # Cache USD prim references on first reset for direct fast updates
         if not hasattr(self, '_prims_initialized'):
-            from isaacsim.core.prims import RigidPrim
+            import omni.usd
+            from pxr import UsdGeom
             
-            # Create views for 4 walls (2 gaps)
-            self._obstacle_views = []
-            for i in range(4):
-                view = RigidPrim(f"/World/envs/env_.*/TestObstacle_{i}", reset_xform_properties=False)
-                view.initialize()
-                self._obstacle_views.append(view)
+            stage = omni.usd.get_context().get_stage()
+            self._obstacle_xforms = []
+            
+            # Cache UsdGeom.Xformable references for direct USD manipulation
+            for obs_idx in range(4):
+                wall_xforms = []
+                for env_idx in range(self.num_envs):
+                    prim_path = f"/World/envs/env_{env_idx}/TestObstacle_{obs_idx}"
+                    prim = stage.GetPrimAtPath(prim_path)
+                    if prim.IsValid():
+                        xformable = UsdGeom.Xformable(prim)
+                        wall_xforms.append(xformable)
+                self._obstacle_xforms.append(wall_xforms)
+            
             self._prims_initialized = True
-            print(f"[DEBUG] Initialized 4 wall views for 2-gap navigation")
+            print(f"[DEBUG] Cached {len(self._obstacle_xforms) * len(self._obstacle_xforms[0])} USD Xform references")
         
         # Reset contact sensors after episode reset
         self._reset_contact_sensors(env_ids_tensor)
@@ -681,12 +687,9 @@ class LeatherbackEnv(DirectRLEnv):
             wall_cfg = CuboidCfg(
                 size=(self.cfg.wall_length, self.cfg.wall_depth, self.cfg.wall_height),  # 1.5m × 0.25m × 1.75m
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    kinematic_enabled=False,  # Dynamic but locked
+                    kinematic_enabled=True,  # Static walls for better performance and stability
                     disable_gravity=True,
-                    max_linear_velocity=0.0,
-                    max_angular_velocity=0.0,
                 ),
-                mass_props=sim_utils.MassPropertiesCfg(mass=10000.0),
                 collision_props=sim_utils.CollisionPropertiesCfg(
                     collision_enabled=True,
                     contact_offset=0.02,
@@ -824,27 +827,39 @@ class LeatherbackEnv(DirectRLEnv):
         # 13. Convert LOCAL to WORLD coordinates
         self._obstacle_positions[env_ids_tensor, :, :2] += self.scene.env_origins[env_ids_tensor, :2].unsqueeze(1)
         
-        # 15. Move all 4 walls using BATCHED view updates (critical for 2048+ envs)
-        # Process environments in batches to avoid overwhelming USD stage updates
-        batch_size = 512
-        num_batches = (num_reset + batch_size - 1) // batch_size
+        # 15. Move all 4 walls using direct USD API with batched change notifications
+        from pxr import Sdf, Gf
+        import omni.usd
         
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, num_reset)
-            batch_env_ids = env_ids_tensor[start_idx:end_idx]
-            
-            for obs_idx in range(4):  # Now 4 walls (2 gaps)
-                if obs_idx < len(self._obstacle_views):
-                    wall_positions = self._obstacle_positions[batch_env_ids, obs_idx, :]
-                    wall_orientations_batch = wall_orientations[batch_env_ids, obs_idx, :]
-                    self._obstacle_views[obs_idx].set_world_poses(
-                        wall_positions, 
-                        wall_orientations_batch, 
-                        indices=batch_env_ids
-                    )
+        stage = omni.usd.get_context().get_stage()
         
-        print(f"[TWO-GAP NAVIGATION] Reset {num_reset} environments in {num_batches} batches: 2 gaps placed AT waypoints (harder)")
+        # Use Sdf.ChangeBlock to batch ALL USD changes into a single notification
+        # This is the KEY optimization - without it, each change triggers full stage update
+        with Sdf.ChangeBlock():
+            for i, env_id in enumerate(env_ids_tensor.cpu().tolist()):
+                for obs_idx in range(4):  # 4 walls
+                    if obs_idx < len(self._obstacle_xforms) and env_id < len(self._obstacle_xforms[obs_idx]):
+                        xformable = self._obstacle_xforms[obs_idx][env_id]
+                        
+                        # Get position and quaternion for this wall
+                        pos = self._obstacle_positions[env_id, obs_idx, :].cpu()
+                        quat = wall_orientations[i, obs_idx, :].cpu()  # [w, x, y, z]
+                        
+                        # Get or create transform ops (translate, orient)
+                        xform_ops = xformable.GetOrderedXformOps()
+                        if len(xform_ops) == 0:
+                            translate_op = xformable.AddTranslateOp()
+                            orient_op = xformable.AddOrientOp()
+                        else:
+                            translate_op = xform_ops[0]
+                            orient_op = xform_ops[1] if len(xform_ops) > 1 else xformable.AddOrientOp()
+                        
+                        # Set transform values
+                        translate_op.Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+                        orient_op.Set(Gf.Quatf(float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])))
+        # All changes are applied in ONE notification when ChangeBlock exits
+        
+        print(f"[TWO-GAP NAVIGATION] Reset {num_reset} environments: 2 gaps placed AT waypoints (harder)")
         # Debug first environment
         if 0 in env_ids_tensor.cpu():
             print(f"  Env 0 Gap 1 walls: {self._obstacle_positions[0, 0, :].cpu().numpy()}, {self._obstacle_positions[0, 1, :].cpu().numpy()}")
@@ -934,4 +949,3 @@ class LeatherbackEnv(DirectRLEnv):
         #     print(f"[DEBUG] WARNING: Scene has no sensors attribute!")
         # 
         # print(f"[DEBUG] === END CONTACT SENSORS DEBUG ===")
-
