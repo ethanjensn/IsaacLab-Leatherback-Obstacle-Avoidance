@@ -90,7 +90,7 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
             channels=1,  # Single horizontal plane
             vertical_fov_range=(0.0, 0.0),  # 0 degrees vertical FOV
             horizontal_fov_range=(0.0, 360.0),  # Full 360 degrees
-            horizontal_res=2.0,  # 2 degree resolution (fewer rays, cleaner visualization)
+            horizontal_res=5.625,  # 5.625 degree resolution = 64 rays (360/64)
         ),
         max_distance=20.0,  # 20m maximum range
         debug_vis=False,  # Disabled initially, enabled after first reset
@@ -129,9 +129,9 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
 @configclass
 class LeatherbackEnvCfg(DirectRLEnvCfg):
     decimation = 4
-    episode_length_s = 40.0
+    episode_length_s = 90.0
     action_space = 2  # Only throttle + steering (STAGE 1 - was 6)
-    observation_space = 9  # STAGE 1: removed 4 shock observations (was 13)
+    observation_space = 71  # 8 base observations + 63 lidar ray distances
     state_space = 0
     sim: SimulationCfg = SimulationCfg(dt=1 / 60, render_interval=decimation)
     robot_cfg: ArticulationCfg = LEATHERBACK_CFG.replace(prim_path="/World/envs/env_.*/Robot")
@@ -162,11 +162,11 @@ class LeatherbackEnvCfg(DirectRLEnvCfg):
     )
     
     # Two-gap navigation configuration (4 walls total)
-    num_obstacles_per_env = 4  # 4 walls per environment (2 gaps with 2 walls each)
+    num_obstacles_per_env = 5  # 4 walls for 2 gaps + 1 random wall
     wall_length = 4.0  # Wall length perpendicular to path (m) - longer to prevent going around
     wall_depth = 0.25  # Wall thickness along path (m)
     wall_height = 1.75  # Wall height (m)
-    gap_size_range = (1.0, 1.4)  # Gap between walls (m) - robot is ~1.5m wide
+    gap_size_range = (1.0, 1.4)  # Gap between walls (m) - robot fits with clearance
     obstacle_cfg: CuboidCfg = CuboidCfg(
         size=(wall_length, wall_depth, wall_height),  # Wall dimensions
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -204,11 +204,6 @@ class LeatherbackEnv(DirectRLEnv):
         self._shock_dof_idx, _ = self.leatherback.find_joints(self.cfg.shock_dof_name)
         self._throttle_state = torch.zeros((self.num_envs,4), device=self.device, dtype=torch.float32)
         self._steering_state = torch.zeros((self.num_envs,2), device=self.device, dtype=torch.float32)
-        # STAGE 1: Shock control disabled
-        # self._shock_targets = torch.zeros((self.num_envs,4), device=self.device, dtype=torch.float32)
-        # self._shock_targets[:, 0:2] = -0.030  # Rear shocks
-        # self._shock_targets[:, 2:4] = 0.030   # Front shocks
-        # self._shock_action = torch.zeros((self.num_envs,4), device=self.device, dtype=torch.float32)  # Initialize for rewards
         self._goal_reached = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
         self.task_completed = torch.zeros((self.num_envs), device=self.device, dtype=torch.bool)
         self._num_goals = 10
@@ -218,24 +213,20 @@ class LeatherbackEnv(DirectRLEnv):
         self.course_length_coefficient = 2.5
         self.course_width_coefficient = 2.0
         self.position_tolerance = 0.15
-        self.goal_reached_bonus = 10.0
-        self.course_completion_bonus = 100.0  # NEW: bonus for finishing all waypoints
-        self.progress_reward_weight = 1.0     # Reward per meter of progress
+        self.goal_reached_bonus = 15.0  # Increased from 10.0 for better waypoint navigation
+        self.position_progress_weight = 2.0  # Increased from 1.0 for stronger progress rewards
+        self.heading_coefficient = 0.25
+        self.heading_progress_weight = 0.1  # Increased from 0.05 for better heading alignment
         self._target_index = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
         
         # Store effective timestep for reward normalization
         # Physics dt * decimation = control timestep
         self.control_dt = self.cfg.sim.dt * self.cfg.decimation
         
-        # STAGE 1: Suspension rewards disabled - re-enable for STAGE 2
-        # self.shock_pos_weight = -0.001
-        # self.shock_vel_weight = -0.0005
-        # self.shock_action_penalty = -0.0001
-        
         # Lidar-based reward parameters for obstacle avoidance
-        self.lidar_danger_distance = 0.5      # Proximity warning threshold (not used when penalty is 0)
-        self.lidar_proximity_penalty = 0.0    # Disabled - robot learns gap navigation implicitly from collisions
-        self.collision_penalty = -10.0        # Hard penalty for collision
+        self.lidar_danger_distance = 0.5      # Proximity warning threshold
+        self.lidar_proximity_penalty = 0.0    # Disabled - waypoints too close, would discourage navigation
+        self.collision_penalty = -5.0        # Hard penalty for collision
 
     def _setup_scene(self):
         # Add Physics Scene for Lidar to work (required by Isaac Sim 5.0.0)
@@ -269,8 +260,8 @@ class LeatherbackEnv(DirectRLEnv):
         # Create obstacles in source environment (env_0) BEFORE cloning
         self._create_obstacles_for_source_env()
         
-        # Clone environments (copy_from_source=False means obstacles won't be copied)
-        self.scene.clone_environments(copy_from_source=False)
+        # Clone environments (copy_from_source=True means obstacles ARE copied to all envs)
+        self.scene.clone_environments(copy_from_source=True)
         # Don't filter collisions - obstacles are per-environment and need to collide with robot
         # self.scene.filter_collisions(global_prim_paths=[])  # Disabled - prevents obstacle collisions
         self.scene.articulations["leatherback"] = self.leatherback
@@ -360,7 +351,7 @@ class LeatherbackEnv(DirectRLEnv):
 
         # Get Lidar data from RayCaster sensor
         lidar_data = self.lidar.data.ray_hits_w  # Shape: (num_envs, num_rays, 3) - hit positions
-        lidar_distances = torch.norm(lidar_data - self.lidar.data.pos_w.unsqueeze(1), dim=-1)  # Calculate distances
+        lidar_distances = torch.norm(lidar_data - self.lidar.data.pos_w.unsqueeze(1), dim=-1)  # Shape: (num_envs, 64)
         
         # Handle inf values (when ray doesn't hit anything)
         # Replace inf with max_distance to avoid numerical issues
@@ -370,7 +361,10 @@ class LeatherbackEnv(DirectRLEnv):
             lidar_distances
         )
         
-        # Store minimum lidar distance per environment
+        # Normalize lidar distances to [0, 1] range for better learning
+        lidar_normalized = lidar_distances / self.cfg.scene.lidar.max_distance  # Shape: (num_envs, 64)
+        
+        # Store minimum lidar distance for debugging/rewards
         self.lidar_min_distance = torch.min(lidar_distances, dim=1)[0]  # Min distance per environment
         
         # # Periodic debug: Print lidar status every 2 seconds (120 steps at 60fps)
@@ -403,7 +397,7 @@ class LeatherbackEnv(DirectRLEnv):
                 # self._shock_targets[:, 1].unsqueeze(dim=1),  # Rear left shock
                 # self._shock_targets[:, 2].unsqueeze(dim=1),  # Front right shock
                 # self._shock_targets[:, 3].unsqueeze(dim=1),  # Front left shock
-                self.lidar_min_distance.unsqueeze(dim=1),  # Lidar minimum distance
+                lidar_normalized,  # All 64 lidar ray distances (normalized to [0,1])
             ),
             dim=-1,
         )
@@ -450,26 +444,9 @@ class LeatherbackEnv(DirectRLEnv):
         return {"policy": obs}
     
     def _get_rewards(self) -> torch.Tensor:
-        # Check for extreme shock velocities before computing rewards
-        shock_velocities_abs = torch.abs(self.leatherback.data.joint_vel[:, self._shock_dof_idx])
-        if torch.any(shock_velocities_abs > 100.0):
-            extreme_shock_envs = torch.any(shock_velocities_abs > 100.0, dim=1)
-            extreme_shock_ids = torch.where(extreme_shock_envs)[0].cpu().numpy().tolist()
-            print(f"[PHYSICS RESET IN REWARDS] Resetting {len(extreme_shock_ids)} environments due to extreme shock velocities")
-            self._reset_idx(extreme_shock_ids)
-        
-        # One-way progress: only reward decreases in distance, ignore increases (detours)
-        distance_change = self._previous_position_error - self._position_error
-        R_progress = self.progress_reward_weight * torch.clamp(distance_change, min=0.0) * self.control_dt
-        
-        # Waypoint reached bonus
+        position_progress_rew = self._previous_position_error - self._position_error
+        target_heading_rew = torch.exp(-torch.abs(self.target_heading_error) / self.heading_coefficient)
         goal_reached = self._position_error < self.position_tolerance
-        R_waypoint = goal_reached.float() * self.goal_reached_bonus
-        
-        # Course completion bonus (all 10 waypoints)
-        next_target_index = self._target_index + goal_reached
-        course_complete = next_target_index >= self._num_goals
-        R_completion = course_complete.float() * self.course_completion_bonus
         
         # Collision penalty (hard)
         obstacle_collision = self._check_obstacle_collisions()
@@ -486,28 +463,24 @@ class LeatherbackEnv(DirectRLEnv):
             torch.zeros_like(min_dist)
         )
         
-        composite_reward = R_progress + R_waypoint + R_completion + R_collision + R_proximity
-        
-        # Update waypoint tracking
         self._target_index = self._target_index + goal_reached
-        self.task_completed = self._target_index >= self._num_goals
-        self._target_index = torch.clamp(self._target_index, max=self._num_goals - 1)
-        
-        # Visualization
+        self.task_completed = self._target_index > (self._num_goals - 1)
+        self._target_index = self._target_index % self._num_goals
+
+        composite_reward = (
+            position_progress_rew * self.position_progress_weight +
+            target_heading_rew * self.heading_progress_weight +
+            goal_reached * self.goal_reached_bonus +
+            R_collision +
+            R_proximity
+        )
+
         one_hot_encoded = torch.nn.functional.one_hot(self._target_index.long(), num_classes=self._num_goals)
         marker_indices = one_hot_encoded.view(-1).tolist()
         self.waypoints.visualize(marker_indices=marker_indices)
-        
-        # Replace any NaN rewards with zeros to prevent training crash
+
         if torch.any(composite_reward.isnan()):
-            nan_count = torch.sum(composite_reward.isnan()).item()
-            print(f"[NaN DEBUG] Step {self.common_step_counter}: {nan_count} NaNs in rewards")
-            print(f"  Progress NaN: {torch.sum(R_progress.isnan()).item()}")
-            print(f"  Waypoint NaN: {torch.sum(R_waypoint.isnan()).item()}")
-            print(f"  Completion NaN: {torch.sum(R_completion.isnan()).item()}")
-            print(f"  Collision NaN: {torch.sum(R_collision.isnan()).item()}")
-            print(f"  Proximity NaN: {torch.sum(R_proximity.isnan()).item()}")
-            composite_reward = torch.where(torch.isnan(composite_reward), torch.zeros_like(composite_reward), composite_reward)
+            raise ValueError("Rewards cannot be NAN")
 
         return composite_reward
 
@@ -599,14 +572,15 @@ class LeatherbackEnv(DirectRLEnv):
         if not hasattr(self, '_prims_initialized'):
             from isaacsim.core.prims import RigidPrim
             
-            # Create views for 4 walls (2 gaps)
+            # Create views for 5 walls (2 gaps + 1 random)
             self._obstacle_views = []
-            for i in range(4):
+            for i in range(5):
                 view = RigidPrim(f"/World/envs/env_.*/TestObstacle_{i}", reset_xform_properties=False)
                 view.initialize()
                 self._obstacle_views.append(view)
+                print(f"[DEBUG] Wall {i} view has {view.count} instances (expected {self.num_envs})")
             self._prims_initialized = True
-            print(f"[DEBUG] Initialized 4 wall views for 2-gap navigation")
+            print(f"[DEBUG] Initialized 5 wall views for 2-gap navigation + 1 random wall")
         
         # Reset contact sensors after episode reset
         self._reset_contact_sensors(env_ids_tensor)
@@ -662,19 +636,19 @@ class LeatherbackEnv(DirectRLEnv):
         # Contact sensor is now managed by the scene
 
     def _create_obstacles_for_source_env(self):
-        """Create two walls in source environment (env_0) BEFORE cloning."""
-        print(f"[DEBUG] Creating 4 wall templates (2 gaps) in source environment (env_0)...")
+        """Create wall templates in source environment (env_0) BEFORE cloning."""
+        print(f"[DEBUG] Creating 5 wall templates (2 gaps + 1 random) in source environment (env_0)...")
         
-        # Initialize tensors for 4 walls (2 gaps)
+        # Initialize tensors for 5 walls (2 gaps + 1 random)
         if self._obstacle_sizes is None:
-            self._obstacle_sizes = torch.zeros((self.num_envs, 4, 3), device=self.device, dtype=torch.float32)
+            self._obstacle_sizes = torch.zeros((self.num_envs, 5, 3), device=self.device, dtype=torch.float32)
         if self._obstacle_positions is None:
-            self._obstacle_positions = torch.zeros((self.num_envs, 4, 3), device=self.device, dtype=torch.float32)
+            self._obstacle_positions = torch.zeros((self.num_envs, 5, 3), device=self.device, dtype=torch.float32)
         
         # Create 4 walls ONLY in source environment (env_0)
         env_idx = 0
         
-        for obs_idx in range(4):  # 4 walls per environment (2 gaps)
+        for obs_idx in range(5):  # 5 walls: 4 for 2 gaps + 1 random wall
             prim_path = f"/World/envs/env_{env_idx}/TestObstacle_{obs_idx}"
             
             # Use fixed wall dimensions from config
@@ -699,7 +673,7 @@ class LeatherbackEnv(DirectRLEnv):
             initial_pos = (0.0, 0.0, self.cfg.wall_height / 2.0)
             wall_cfg.func(prim_path, wall_cfg, translation=initial_pos)
         
-        print(f"[DEBUG] Created 4 wall templates (2 gaps) in env_0")
+        print(f"[DEBUG] Created 5 wall templates (2 gaps + 1 random) in env_0")
     
     def _reset_obstacle_positions(self, env_ids: torch.Tensor | Sequence[int]):
         """Place two walls perpendicular to path between waypoints to create a gap the robot must navigate through."""
@@ -824,7 +798,51 @@ class LeatherbackEnv(DirectRLEnv):
         # 13. Convert LOCAL to WORLD coordinates
         self._obstacle_positions[env_ids_tensor, :, :2] += self.scene.env_origins[env_ids_tensor, :2].unsqueeze(1)
         
-        # 15. Move all 4 walls using BATCHED view updates (critical for 2048+ envs)
+        # 14. Add exactly 1 random solid wall with collision avoidance
+        min_wall_spacing = 4.0  # Minimum 4m between any walls
+        min_start_distance = 6.0  # Minimum 6m from robot start
+        
+        for env_offset in range(num_reset):
+            env_id = env_ids_tensor[env_offset]
+            
+            # Get existing gap wall positions for this environment (indices 0-3)
+            existing_positions = self._obstacle_positions[env_id, 0:4, :2].clone()
+            robot_start = self.leatherback.data.root_pos_w[env_id, :2]
+            
+            max_attempts = 20  # Try up to 20 times to find valid position
+            placed = False
+            
+            for attempt in range(max_attempts):
+                # Pick random waypoint segment (exclude first segment 0->1)
+                segment_idx = torch.randint(2, self._num_goals, (1,), device=self.device).item()
+                
+                # Get waypoint positions in world coords
+                wp_start = self._target_positions[env_id, segment_idx - 1, :2]
+                wp_end = self._target_positions[env_id, segment_idx, :2]
+                
+                # Place wall at random position along segment (20%-80%)
+                t = torch.rand(1, device=self.device).item() * 0.6 + 0.2
+                wall_center = wp_start + t * (wp_end - wp_start)
+                
+                # Check collision with existing gap walls
+                distances_to_gaps = torch.norm(existing_positions - wall_center.unsqueeze(0), dim=1)
+                min_gap_dist = torch.min(distances_to_gaps).item()
+                
+                # Check distance from robot start
+                dist_from_start = torch.norm(wall_center - robot_start).item()
+                
+                # Accept position if it's far enough from everything
+                if min_gap_dist >= min_wall_spacing and dist_from_start >= min_start_distance:
+                    self._obstacle_positions[env_id, 4, :2] = wall_center
+                    self._obstacle_positions[env_id, 4, 2] = self.cfg.wall_height / 2.0
+                    placed = True
+                    break
+            
+            # If couldn't place after max attempts, put far away
+            if not placed:
+                self._obstacle_positions[env_id, 4, :] = torch.tensor([10000.0, 10000.0, 0.0], device=self.device)
+        
+        # 15. Move all 5 walls using BATCHED view updates (critical for 2048+ envs)
         # Process environments in batches to avoid overwhelming USD stage updates
         batch_size = 512
         num_batches = (num_reset + batch_size - 1) // batch_size
@@ -834,21 +852,40 @@ class LeatherbackEnv(DirectRLEnv):
             end_idx = min(start_idx + batch_size, num_reset)
             batch_env_ids = env_ids_tensor[start_idx:end_idx]
             
-            for obs_idx in range(4):  # Now 4 walls (2 gaps)
+            for obs_idx in range(5):  # 4 gap walls + 1 random wall
                 if obs_idx < len(self._obstacle_views):
+                    view = self._obstacle_views[obs_idx]
+                    # Safety check: ensure view has instances for all batch environments
+                    max_env_id = torch.max(batch_env_ids).item()
+                    if view.count <= max_env_id:
+                        print(f"[ERROR] Wall {obs_idx} view has only {view.count} instances but trying to access env {max_env_id}")
+                        continue
+                    
                     wall_positions = self._obstacle_positions[batch_env_ids, obs_idx, :]
-                    wall_orientations_batch = wall_orientations[batch_env_ids, obs_idx, :]
-                    self._obstacle_views[obs_idx].set_world_poses(
+                    
+                    if obs_idx < 4:
+                        # Gap walls use calculated orientations
+                        wall_orientations_batch = wall_orientations[start_idx:end_idx, obs_idx, :]
+                    else:
+                        # Random wall gets random rotation (0-120 degrees)
+                        wall_orientations_batch = torch.zeros((len(batch_env_ids), 4), device=self.device, dtype=torch.float32)
+                        random_angles = torch.rand(len(batch_env_ids), device=self.device) * (2 * torch.pi / 3)  # 0 to 120 degrees
+                        half_angles = random_angles / 2.0
+                        wall_orientations_batch[:, 0] = torch.cos(half_angles)
+                        wall_orientations_batch[:, 3] = torch.sin(half_angles)
+                    
+                    view.set_world_poses(
                         wall_positions, 
                         wall_orientations_batch, 
                         indices=batch_env_ids
                     )
         
-        print(f"[TWO-GAP NAVIGATION] Reset {num_reset} environments in {num_batches} batches: 2 gaps placed AT waypoints (harder)")
+        print(f"[TWO-GAP + WALL] Reset {num_reset} environments in {num_batches} batches: 2 gaps + 1 random wall")
         # Debug first environment
         if 0 in env_ids_tensor.cpu():
             print(f"  Env 0 Gap 1 walls: {self._obstacle_positions[0, 0, :].cpu().numpy()}, {self._obstacle_positions[0, 1, :].cpu().numpy()}")
             print(f"  Env 0 Gap 2 walls: {self._obstacle_positions[0, 2, :].cpu().numpy()}, {self._obstacle_positions[0, 3, :].cpu().numpy()}")
+            print(f"  Env 0 Random wall: {self._obstacle_positions[0, 4, :2].cpu().numpy()}")
 
     def _debug_robot_bodies(self):
         """Debug method to list all rigid bodies (simplified, no PhysX API calls)."""
