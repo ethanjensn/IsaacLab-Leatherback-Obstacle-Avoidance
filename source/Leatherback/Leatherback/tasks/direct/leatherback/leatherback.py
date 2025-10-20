@@ -26,7 +26,7 @@ LEATHERBACK_CFG = ArticulationCfg(
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
-            solver_position_iteration_count=8,
+            solver_position_iteration_count=4,  # Reduced from 8 for faster initialization
             solver_velocity_iteration_count=1,
             sleep_threshold=0.005,
             stabilization_threshold=0.001,
@@ -34,7 +34,7 @@ LEATHERBACK_CFG = ArticulationCfg(
         activate_contact_sensors=True,  # Enable contact sensors on the robot
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.05),
+        pos=(0.0, 0.0, 0.0),  # Increased from 0.05m to 0.25m to prevent initial drop/bounce
         joint_pos={
             "Wheel__Knuckle__Front_Left": 0.0,
             "Wheel__Knuckle__Front_Right": 0.0,
@@ -74,8 +74,8 @@ LEATHERBACK_CFG = ArticulationCfg(
             joint_names_expr=["Shock.*"],
             effort_limit_sim=10000.0,
             velocity_limit_sim=5.0,
-            stiffness=0.0,
-            damping=0.0,
+            stiffness=1213.38,  # N/m - Baja passive suspension (f_n=2.5Hz, m=19.67kg MEASURED)
+            damping=46.35,      # N·s/m - Damping ratio ζ=0.3
         ),
     },
 )
