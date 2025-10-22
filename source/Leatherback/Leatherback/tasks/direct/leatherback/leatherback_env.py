@@ -239,10 +239,8 @@ class LeatherbackEnv(DirectRLEnv):
         self.course_length_coefficient = 2.5
         self.course_width_coefficient = 2.0
         self.position_tolerance = 0.15
-        self.goal_reached_bonus = 15.0  # Increased from 10.0 for better waypoint navigation
-        self.position_progress_weight = 2.0  # Increased from 1.0 for stronger progress rewards
-        self.heading_coefficient = 0.25
-        self.heading_progress_weight = 0.1  # Increased from 0.05 for better heading alignment
+        self.goal_reached_bonus = 10.0
+        self.progress_reward_weight = 1.0     # Reward per meter of progress (one-way)
         self._target_index = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
         
         # Store effective timestep for reward normalization
@@ -251,8 +249,8 @@ class LeatherbackEnv(DirectRLEnv):
         
         # Lidar-based reward parameters for obstacle avoidance
         self.lidar_danger_distance = 0.5      # Proximity warning threshold
-        self.lidar_proximity_penalty = 0.0    # Disabled - waypoints too close, would discourage navigation
-        self.collision_penalty = -5.0        # Hard penalty for collision
+        self.lidar_proximity_penalty = 0.0    # Disabled - robot learns gap navigation implicitly from collisions
+        self.collision_penalty = -10.0        # Hard penalty for collision
         
         # Baja passive suspension parameters - calculate spring/damper from robot mass
         # Measure robot mass after first simulation step (mass not available yet)
@@ -702,26 +700,29 @@ class LeatherbackEnv(DirectRLEnv):
         return {"policy": obs}
     
     def _get_rewards(self) -> torch.Tensor:
-        position_progress_rew = self._previous_position_error - self._position_error
-        target_heading_rew = torch.exp(-torch.abs(self.target_heading_error) / self.heading_coefficient)
+        # One-way progress: only reward decreases in distance, ignore increases (detours)
+        distance_change = self._previous_position_error - self._position_error
+        position_progress_rew = self.progress_reward_weight * torch.clamp(distance_change, min=0.0)
+        
+        # Waypoint reached bonus
         goal_reached = self._position_error < self.position_tolerance
+        R_waypoint = goal_reached.float() * self.goal_reached_bonus
         
         # Collision penalty (hard)
         obstacle_collision = self._check_obstacle_collisions()
         R_collision = self.collision_penalty * obstacle_collision.float()
         
-        # Proximity warning (smooth, scaled with distance)
-        # Penalty increases as robot gets closer: 0 at danger_distance, -0.5 at collision
+        # Proximity warning (disabled - set to 0.0)
         min_dist = self.lidar_min_distance
         proximity_mask = min_dist < self.lidar_danger_distance
         distance_ratio = torch.clamp(min_dist / self.lidar_danger_distance, min=0.0, max=1.0)
         R_proximity = torch.where(
             proximity_mask,
-            self.lidar_proximity_penalty * (1.0 - distance_ratio) * self.control_dt,  # Smooth scaling
+            self.lidar_proximity_penalty * (1.0 - distance_ratio) * self.control_dt,
             torch.zeros_like(min_dist)
         )
         
-        # Shock detection and recovery rewards (Baja passive suspension)
+        # Shock detection and recovery rewards (keep current system)
         shock_events = self._detect_shock_events()
         R_shock = torch.where(shock_events, torch.tensor(self.shock_penalty, device=self.device), torch.tensor(0.0, device=self.device))
         
@@ -739,27 +740,29 @@ class LeatherbackEnv(DirectRLEnv):
         # Update previous vertical velocity for next step's shock detection
         self.prev_vertical_vel = self.leatherback.data.root_lin_vel_w[:, 2].clone()
         
+        # Update waypoint tracking
         self._target_index = self._target_index + goal_reached
         self.task_completed = self._target_index > (self._num_goals - 1)
         self._target_index = self._target_index % self._num_goals
-
+        
+        # Composite reward: progress + waypoint + collision + shocks (NO heading, NO course completion)
         composite_reward = (
-            position_progress_rew * self.position_progress_weight +
-            target_heading_rew * self.heading_progress_weight +
-            goal_reached * self.goal_reached_bonus +  # Restored: +15 per waypoint
+            position_progress_rew +
+            R_waypoint +
             R_collision +
             R_proximity +
-            R_shock +       # Gentle -0.2 penalty for suspension management
-            R_recovery      # Gentle +0.1 bonus for recovery
+            R_shock +
+            R_recovery
         )
-
+        
+        # Visualization
         one_hot_encoded = torch.nn.functional.one_hot(self._target_index.long(), num_classes=self._num_goals)
         marker_indices = one_hot_encoded.view(-1).tolist()
         self.waypoints.visualize(marker_indices=marker_indices)
-
+        
         if torch.any(composite_reward.isnan()):
             raise ValueError("Rewards cannot be NAN")
-
+        
         return composite_reward
 
     def _check_obstacle_collisions(self):
