@@ -6,7 +6,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationCfg
+from isaaclab.sim import SimulationCfg, PhysxCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.sim.spawners.shapes import CuboidCfg
 from isaaclab.utils import configclass
@@ -21,112 +21,114 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
     """Configuration for the Leatherback environment scene."""
     
     # Contact sensors for obstacle detection - specific sensors for each wheel and chassis
-    # No filter = track ALL contacts (ground, walls, objects). Use physics-based thresholds to distinguish.
-    # Update at 60Hz (0.0167s) instead of every physics step to reduce initialization overhead
-    contact_chassis = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Chassis",  # Chassis sensor
-        update_period=0.0167,  # 60Hz update rate (sufficient for collision detection)
-        history_length=1,  # Store latest contact data
-        debug_vis=False,  # Disable visualization to reduce overhead
-        track_pose=False,
-        track_contact_points=False,
-        track_air_time=False,
-        force_threshold=0.1,  # Low threshold to detect all contacts
-        filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
-    )
-    
-    contact_wheel_front_left = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Wheel_Front_Left",  # Front left wheel
-        update_period=0.0167,  # 60Hz update rate
-        history_length=1,  # Store latest contact data
-        debug_vis=False,  # Disable visualization to reduce overhead
-        track_pose=False,
-        track_contact_points=False,
-        track_air_time=False,
-        force_threshold=0.1,  # Low threshold to detect all contacts
-        filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
-    )
-    
-    contact_wheel_front_right = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Wheel_Front_Right",  # Front right wheel
-        update_period=0.0167,  # 60Hz update rate
-        history_length=1,  # Store latest contact data
-        debug_vis=False,  # Disable visualization to reduce overhead
-        track_pose=False,
-        track_contact_points=False,
-        track_air_time=False,
-        force_threshold=0.1,  # Low threshold to detect all contacts
-        filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
-    )
-    
-    contact_wheel_rear_right = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Wheel_Rear_Right",  # Rear right wheel
-        update_period=0.0167,  # 60Hz update rate
-        history_length=1,  # Store latest contact data
-        debug_vis=False,  # Disable visualization to reduce overhead
-        track_pose=False,
-        track_contact_points=False,
-        track_air_time=False,
-        force_threshold=0.1,  # Low threshold to detect all contacts
-        filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
-    )
-    
-    contact_wheel_rear_left = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Wheel_Rear_Left",  # Rear left wheel
-        update_period=0.0167,  # 60Hz update rate
-        history_length=1,  # Store latest contact data
-        debug_vis=False,  # Disable visualization to reduce overhead
-        track_pose=False,
-        track_contact_points=False,
-        track_air_time=False,
-        force_threshold=0.1,  # Low threshold to detect all contacts
-        filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
-    )
+    # DEFERRED: Sensors commented out during init to speed up clone_environments()
+    # They will be created lazily after first reset
+    # contact_chassis = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Chassis",  # Chassis sensor
+    #     update_period=0.0167,  # 60Hz update rate
+    #     history_length=1,  # Store latest contact data
+    #     debug_vis=False,  # Disable visualization to reduce overhead
+    #     track_pose=False,
+    #     track_contact_points=False,
+    #     track_air_time=False,
+    #     force_threshold=0.1,  # Low threshold to detect all contacts
+    #     filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
+    # )
+    # 
+    # contact_wheel_front_left = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Wheel_Front_Left",  # Front left wheel
+    #     update_period=0.0167,  # 60Hz update rate
+    #     history_length=1,  # Store latest contact data
+    #     debug_vis=False,  # Disable visualization to reduce overhead
+    #     track_pose=False,
+    #     track_contact_points=False,
+    #     track_air_time=False,
+    #     force_threshold=0.1,  # Low threshold to detect all contacts
+    #     filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
+    # )
+    # 
+    # contact_wheel_front_right = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Wheel_Front_Right",  # Front right wheel
+    #     update_period=0.0167,  # 60Hz update rate
+    #     history_length=1,  # Store latest contact data
+    #     debug_vis=False,  # Disable visualization to reduce overhead
+    #     track_pose=False,
+    #     track_contact_points=False,
+    #     track_air_time=False,
+    #     force_threshold=0.1,  # Low threshold to detect all contacts
+    #     filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
+    # )
+    # 
+    # contact_wheel_rear_right = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Wheel_Rear_Right",  # Rear right wheel
+    #     update_period=0.0167,  # 60Hz update rate
+    #     history_length=1,  # Store latest contact data
+    #     debug_vis=False,  # Disable visualization to reduce overhead
+    #     track_pose=False,
+    #     track_contact_points=False,
+    #     track_air_time=False,
+    #     force_threshold=0.1,  # Low threshold to detect all contacts
+    #     filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
+    # )
+    # 
+    # contact_wheel_rear_left = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Wheel_Rear_Left",  # Rear left wheel
+    #     update_period=0.0167,  # 60Hz update rate
+    #     history_length=1,  # Store latest contact data
+    #     debug_vis=False,  # Disable visualization to reduce overhead
+    #     track_pose=False,
+    #     track_contact_points=False,
+    #     track_air_time=False,
+    #     force_threshold=0.1,  # Low threshold to detect all contacts
+    #     filter_prim_paths_expr=[],  # Empty = track all contacts (robust approach)
+    # )
     
     # Lidar sensor attached to chassis using Isaac Lab's MultiMeshRayCaster
-    lidar = MultiMeshRayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Chassis",
-        offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.3)),  # 0.3m up from chassis
-        pattern_cfg=patterns.LidarPatternCfg(
-            channels=1,  # Single horizontal plane
-            vertical_fov_range=(0.0, 0.0),  # 0 degrees vertical FOV
-            horizontal_fov_range=(0.0, 360.0),  # Full 360 degrees
-            horizontal_res=5.625,  # 5.625 degree resolution = 63 rays (360° excludes duplicate at 0°)
-        ),
-        max_distance=20.0,  # 20m maximum range
-        update_period=0.0167,  # 60Hz update rate to reduce initialization overhead
-        debug_vis=False,  # Disabled initially, enabled after first reset
-        visualizer_cfg=BLUE_ARROW_X_MARKER_CFG.replace(
-            prim_path="/Visuals/LidarRayCaster",  # Global visualization path
-            markers={
-                "hit": sim_utils.SphereCfg(
-                    radius=0.15,  # Medium-sized red hit points
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),  # Red color
-                ),
-                # Only show hit points, no ray lines to avoid stranded rays
-            },
-        ),
-        mesh_prim_paths=[
-            MultiMeshRayCasterCfg.RaycastTargetCfg(
-                target_prim_expr="/World/ground",
-                track_mesh_transforms=True,  # Ground is static
-            ),
-            MultiMeshRayCasterCfg.RaycastTargetCfg(
-                target_prim_expr="{ENV_REGEX_NS}/TestObstacle_.*",
-                track_mesh_transforms=True,  # Obstacles only move during reset, not during simulation
-            ),
-            # Test wall commented out - no walls to detect
-            # MultiMeshRayCasterCfg.RaycastTargetCfg(
-            #     target_prim_expr="{ENV_REGEX_NS}/TestWall",
-            #     track_mesh_transforms=True,  # Wall moves during reset
-            # ),
-            # Exclude robot from lidar detection to avoid self-collision
-            # MultiMeshRayCasterCfg.RaycastTargetCfg(
-            #     target_prim_expr="{ENV_REGEX_NS}/Robot/.*",
-            #     track_mesh_transforms=True,
-            # ),
-        ],
-    )
+    # DEFERRED: LIDAR commented out during init to speed up clone_environments()
+    # It will be created lazily after first reset
+    # lidar = MultiMeshRayCasterCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/Rigid_Bodies/Chassis",
+    #     offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.3)),  # 0.3m up from chassis
+    #     pattern_cfg=patterns.LidarPatternCfg(
+    #         channels=1,  # Single horizontal plane
+    #         vertical_fov_range=(0.0, 0.0),  # 0 degrees vertical FOV
+    #         horizontal_fov_range=(0.0, 360.0),  # Full 360 degrees
+    #         horizontal_res=5.625,  # 5.625 degree resolution = 63 rays (360° excludes duplicate at 0°)
+    #     ),
+    #     max_distance=20.0,  # 20m maximum range
+    #     update_period=0.0167,  # 60Hz update rate
+    #     debug_vis=False,  # Disabled initially, enabled after first reset
+    #     visualizer_cfg=BLUE_ARROW_X_MARKER_CFG.replace(
+    #         prim_path="/Visuals/LidarRayCaster",  # Global visualization path
+    #         markers={
+    #             "hit": sim_utils.SphereCfg(
+    #                 radius=0.15,  # Medium-sized red hit points
+    #                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),  # Red color
+    #             ),
+    #             # Only show hit points, no ray lines to avoid stranded rays
+    #         },
+    #     ),
+    #     mesh_prim_paths=[
+    #         MultiMeshRayCasterCfg.RaycastTargetCfg(
+    #             target_prim_expr="/World/ground",
+    #             track_mesh_transforms=True,  # Ground is static
+    #         ),
+    #         MultiMeshRayCasterCfg.RaycastTargetCfg(
+    #             target_prim_expr="{ENV_REGEX_NS}/TestObstacle_.*",
+    #             track_mesh_transforms=True,  # Obstacles only move during reset, not during simulation
+    #         ),
+    #         # Test wall commented out - no walls to detect
+    #         # MultiMeshRayCasterCfg.RaycastTargetCfg(
+    #         #     target_prim_expr="{ENV_REGEX_NS}/TestWall",
+    #         #     track_mesh_transforms=True,  # Wall moves during reset
+    #         # ),
+    #         # Exclude robot from lidar detection to avoid self-collision
+    #         # MultiMeshRayCasterCfg.RaycastTargetCfg(
+    #         #     target_prim_expr="{ENV_REGEX_NS}/Robot/.*",
+    #         #     track_mesh_transforms=True,
+    #         # ),
+    #     ],
+    # )
 
 @configclass
 class LeatherbackEnvCfg(DirectRLEnvCfg):
@@ -135,7 +137,20 @@ class LeatherbackEnvCfg(DirectRLEnvCfg):
     action_space = 2  # Only throttle + steering (passive shocks)
     observation_space = 79  # 8 base + 8 shock (4 pos + 4 vel) + 63 lidar (360/5.625 excludes duplicate at 360°)
     state_space = 0
-    sim: SimulationCfg = SimulationCfg(dt=1 / 60, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(
+        dt=1 / 60, 
+        render_interval=decimation,
+        device="cuda:0",  # Explicitly use GPU for PhysX simulation
+        use_fabric=True,  # Use Fabric for efficient GPU physics data access (required for GPU sim)
+        physx=PhysxCfg(
+            # Increase GPU buffers for 16K+ environments with many collision objects
+            gpu_max_rigid_contact_count=2**24,  # Increased from 2^23 (8M -> 16M contacts)
+            gpu_max_rigid_patch_count=2**22,    # Increased to 4.2M patches (2^22) to fix overflow with 4096+ envs
+            gpu_found_lost_pairs_capacity=2**22,  # Increased from 2^21 (2M -> 4M pairs)
+            gpu_heap_capacity=2**27,  # Increased from 2^26 for more collision data
+            gpu_temp_buffer_capacity=2**25,  # Increased from 2^24 for temporary collision data
+        ),
+    )
     robot_cfg: ArticulationCfg = LEATHERBACK_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     waypoint_cfg = WAYPOINT_CFG
 
@@ -192,6 +207,13 @@ class LeatherbackEnv(DirectRLEnv):
         
         super().__init__(cfg, render_mode, **kwargs)
         
+        # Lazy sensor initialization flags for faster startup
+        self._contact_sensors_initialized = False
+        self._lidar_initialized = False
+        
+        # Store LIDAR config values since cfg.scene.lidar is commented out
+        self._lidar_max_distance = 20.0  # Same as LIDAR config
+        
         # Obstacle tensors should have been initialized during scene setup
         # Safety check in case they weren't
         if self._obstacle_positions is None:
@@ -239,9 +261,10 @@ class LeatherbackEnv(DirectRLEnv):
         self.damping_per_wheel = 0.0
         
         # Shock detection and recovery tracking for reward system
-        self.shock_vertical_accel_threshold = 3.0 * 9.81  # 3g in m/s²
-        self.shock_contact_impulse_threshold = 50.0  # N (force threshold)
+        self.shock_vertical_accel_threshold = 5.0 * 9.81  # 5g in m/s² - detects aggressive terrain driving (was 3g)
         self.recovery_window = 2.0  # seconds
+        self.shock_penalty = -0.2  # Gentle penalty - was too strong at -2.0 (caused -800 reward)
+        self.recovery_bonus = 0.1  # Gentle bonus - was too strong at 1.0
         self.shock_detected = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.shock_timer = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.recovering = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -261,7 +284,7 @@ class LeatherbackEnv(DirectRLEnv):
         spawn_ground_plane(
             prim_path="/World/ground",
             cfg=GroundPlaneCfg(
-                size=(3000.0, 3000.0),  # Large enough for 4096 envs at 40m spacing (64x64 grid = 2560m + buffer)
+                size=(10000.0, 10000.0),  # Large enough for 32K+ envs at 40m spacing (181x181 grid = 7240m + buffer)
                 color=(0.2, 0.2, 0.2),  # Dark gray color
                 physics_material=sim_utils.RigidBodyMaterialCfg(
                     friction_combine_mode="multiply",
@@ -276,7 +299,9 @@ class LeatherbackEnv(DirectRLEnv):
         # Setup rest of the scene
         self.leatherback = Articulation(self.cfg.robot_cfg)
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
-        self.lidar = MultiMeshRayCaster(self.cfg.scene.lidar)
+        # DEFERRED: LIDAR creation commented out to speed up initialization
+        # self.lidar = MultiMeshRayCaster(self.cfg.scene.lidar)
+        self.lidar = None  # Will be created lazily after first reset
         self.object_state = []
         
         # Create obstacles in source environment (env_0) BEFORE cloning
@@ -288,9 +313,10 @@ class LeatherbackEnv(DirectRLEnv):
         # self.scene.filter_collisions(global_prim_paths=[])  # Disabled - prevents obstacle collisions
         self.scene.articulations["leatherback"] = self.leatherback
         
+        # DEFERRED: Sensor registration commented out - sensors will be created/registered after first reset
         # Register sensors with scene AFTER cloning to ensure proper multi-env initialization
         # This prevents race conditions and ensures all environments have valid sensor data
-        self.scene.sensors["lidar"] = self.lidar
+        # self.scene.sensors["lidar"] = self.lidar
         
         # Contact sensors and lidar are now configured in the scene configuration
         
@@ -308,6 +334,133 @@ class LeatherbackEnv(DirectRLEnv):
             self._obstacle_views.append(view)
         self._prims_initialized = True
         print(f"[SCENE SETUP] Initialized 5 wall views for obstacle navigation")
+
+    def _initialize_contact_sensors(self):
+        """Create and initialize contact sensors after first reset to speed up initialization."""
+        from isaaclab.sensors import ContactSensor, ContactSensorCfg
+        
+        print("[LAZY INIT] Creating contact sensors after first reset...")
+        
+        # Define contact sensor configs
+        sensor_configs = {
+            'contact_chassis': ContactSensorCfg(
+                prim_path=f"{self.scene.env_regex_ns}/Robot/Rigid_Bodies/Chassis",
+                update_period=0.0167,
+                history_length=1,
+                debug_vis=False,
+                track_pose=False,
+                track_contact_points=False,
+                track_air_time=False,
+                force_threshold=0.1,
+                filter_prim_paths_expr=["/World/ground"],  # Exclude ground - only detect obstacle collisions
+            ),
+            'contact_wheel_front_left': ContactSensorCfg(
+                prim_path=f"{self.scene.env_regex_ns}/Robot/Rigid_Bodies/Wheel_Front_Left",
+                update_period=0.0167,
+                history_length=1,
+                debug_vis=False,
+                track_pose=False,
+                track_contact_points=False,
+                track_air_time=False,
+                force_threshold=0.1,
+                filter_prim_paths_expr=["/World/ground"],  # Exclude ground - only detect obstacle collisions
+            ),
+            'contact_wheel_front_right': ContactSensorCfg(
+                prim_path=f"{self.scene.env_regex_ns}/Robot/Rigid_Bodies/Wheel_Front_Right",
+                update_period=0.0167,
+                history_length=1,
+                debug_vis=False,
+                track_pose=False,
+                track_contact_points=False,
+                track_air_time=False,
+                force_threshold=0.1,
+                filter_prim_paths_expr=["/World/ground"],  # Exclude ground - only detect obstacle collisions
+            ),
+            'contact_wheel_rear_right': ContactSensorCfg(
+                prim_path=f"{self.scene.env_regex_ns}/Robot/Rigid_Bodies/Wheel_Rear_Right",
+                update_period=0.0167,
+                history_length=1,
+                debug_vis=False,
+                track_pose=False,
+                track_contact_points=False,
+                track_air_time=False,
+                force_threshold=0.1,
+                filter_prim_paths_expr=["/World/ground"],  # Exclude ground - only detect obstacle collisions
+            ),
+            'contact_wheel_rear_left': ContactSensorCfg(
+                prim_path=f"{self.scene.env_regex_ns}/Robot/Rigid_Bodies/Wheel_Rear_Left",
+                update_period=0.0167,
+                history_length=1,
+                debug_vis=False,
+                track_pose=False,
+                track_contact_points=False,
+                track_air_time=False,
+                force_threshold=0.1,
+                filter_prim_paths_expr=["/World/ground"],  # Exclude ground - only detect obstacle collisions
+            ),
+        }
+        
+        # Create and register sensors
+        for sensor_name, sensor_cfg in sensor_configs.items():
+            sensor = ContactSensor(sensor_cfg)
+            # Initialize sensor internal state (required for _timestamp, etc.)
+            if not sensor.is_initialized:
+                sensor._initialize_impl()
+            self.scene.sensors[sensor_name] = sensor
+        
+        self._contact_sensors_initialized = True
+        print("[LAZY INIT] Contact sensors created and initialized successfully")
+
+    def _initialize_lidar(self):
+        """Create and initialize LIDAR sensor after first reset to speed up initialization."""
+        from isaaclab.sensors import MultiMeshRayCaster, MultiMeshRayCasterCfg, patterns
+        from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG
+        
+        print("[LAZY INIT] Creating LIDAR sensor after first reset...")
+        
+        # Create LIDAR config
+        lidar_cfg = MultiMeshRayCasterCfg(
+            prim_path=f"{self.scene.env_regex_ns}/Robot/Rigid_Bodies/Chassis",
+            offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.3)),
+            pattern_cfg=patterns.LidarPatternCfg(
+                channels=1,
+                vertical_fov_range=(0.0, 0.0),
+                horizontal_fov_range=(0.0, 360.0),
+                horizontal_res=5.625,
+            ),
+            max_distance=20.0,
+            update_period=0.0167,
+            debug_vis=False,
+            visualizer_cfg=BLUE_ARROW_X_MARKER_CFG.replace(
+                prim_path="/Visuals/LidarRayCaster",
+                markers={
+                    "hit": sim_utils.SphereCfg(
+                        radius=0.15,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+                    ),
+                },
+            ),
+            mesh_prim_paths=[
+                MultiMeshRayCasterCfg.RaycastTargetCfg(
+                    target_prim_expr="/World/ground",
+                    track_mesh_transforms=True,
+                ),
+                MultiMeshRayCasterCfg.RaycastTargetCfg(
+                    target_prim_expr=f"{self.scene.env_regex_ns}/TestObstacle_.*",
+                    track_mesh_transforms=True,
+                ),
+            ],
+        )
+        
+        # Create and register LIDAR
+        self.lidar = MultiMeshRayCaster(lidar_cfg)
+        # Initialize LIDAR internal state (required for _timestamp, etc.)
+        if not self.lidar.is_initialized:
+            self.lidar._initialize_impl()
+        self.scene.sensors["lidar"] = self.lidar
+        
+        self._lidar_initialized = True
+        print("[LAZY INIT] LIDAR sensor created and initialized successfully")
 
     def _configure_suspension_from_mass(self):
         """Calculate and configure Baja-style passive suspension based on measured robot mass.
@@ -401,14 +554,23 @@ class LeatherbackEnv(DirectRLEnv):
                 pass
 
     def _get_observations(self) -> dict:
+        # Initialize contact sensors on first call (after first reset)
+        if not self._contact_sensors_initialized:
+            self._initialize_contact_sensors()
+        
+        # Initialize LIDAR on first call (after first reset)
+        if not self._lidar_initialized:
+            self._initialize_lidar()
+        
         # Detect environments with corrupted physics data
         pos_nan = torch.isnan(self.leatherback.data.root_pos_w).any(dim=1)
         vel_nan = torch.isnan(self.leatherback.data.root_lin_vel_b).any(dim=1)
         ang_nan = torch.isnan(self.leatherback.data.root_ang_vel_w).any(dim=1)
         
         # Also detect extreme positions (robots that have "teleported" to infinity)
-        # Use much lower threshold - robots should stay within reasonable course bounds
-        pos_extreme = torch.any(torch.abs(self.leatherback.data.root_pos_w) > 1000.0, dim=1)
+        # For 16K+ envs at 40m spacing, max legitimate distance is ~3600m from origin
+        # Set threshold to 10,000m to only catch actual physics explosions
+        pos_extreme = torch.any(torch.abs(self.leatherback.data.root_pos_w) > 10000.0, dim=1)
         
         # Detect extreme shock velocities (sign of physics instability)
         shock_velocities_abs = torch.abs(self.leatherback.data.joint_vel[:, self._shock_dof_idx])
@@ -418,22 +580,23 @@ class LeatherbackEnv(DirectRLEnv):
         
         if torch.any(corrupted_envs):
             corrupted_env_ids_tensor = torch.where(corrupted_envs)[0]
-            corrupted_env_ids = corrupted_env_ids_tensor.cpu().numpy().tolist()
-            print(f"[PHYSICS RESET] Resetting {len(corrupted_env_ids)} environments due to corrupted/extreme physics")
-            self._reset_idx(corrupted_env_ids)
+            # Optimized: Pass tensor directly, avoid CPU sync
+            print(f"[PHYSICS RESET] Resetting {corrupted_env_ids_tensor.shape[0]} environments due to corrupted/extreme physics")
+            self._reset_idx(corrupted_env_ids_tensor)
         
         # Debug: Print shock activity every 2 seconds (120 steps at 60Hz)
-        self._shock_debug_counter += 1
-        
-        if self._shock_debug_counter % 120 == 0:
-            env_idx = 0  # Monitor first environment
-            shock_pos = self.leatherback.data.joint_pos[env_idx, self._shock_dof_idx].cpu().numpy()
-            shock_vel = self.leatherback.data.joint_vel[env_idx, self._shock_dof_idx].cpu().numpy()
-            speed = torch.norm(self.leatherback.data.root_lin_vel_b[env_idx, :2]).item()
-            
-            print(f"[SHOCK] Env 0 @ {speed:.2f}m/s:")
-            print(f"  Positions: RR={shock_pos[0]:.4f}, RL={shock_pos[1]:.4f}, FR={shock_pos[2]:.4f}, FL={shock_pos[3]:.4f}")
-            print(f"  Velocities: RR={shock_vel[0]:.4f}, RL={shock_vel[1]:.4f}, FR={shock_vel[2]:.4f}, FL={shock_vel[3]:.4f}")
+        # DISABLED FOR PERFORMANCE: Causes CPU sync overhead
+        # self._shock_debug_counter += 1
+        # 
+        # if self._shock_debug_counter % 120 == 0:
+        #     env_idx = 0  # Monitor first environment
+        #     shock_pos = self.leatherback.data.joint_pos[env_idx, self._shock_dof_idx].cpu().numpy()
+        #     shock_vel = self.leatherback.data.joint_vel[env_idx, self._shock_dof_idx].cpu().numpy()
+        #     speed = torch.norm(self.leatherback.data.root_lin_vel_b[env_idx, :2]).item()
+        #     
+        #     print(f"[SHOCK] Env 0 @ {speed:.2f}m/s:")
+        #     print(f"  Positions: RR={shock_pos[0]:.4f}, RL={shock_pos[1]:.4f}, FR={shock_pos[2]:.4f}, FL={shock_pos[3]:.4f}")
+        #     print(f"  Velocities: RR={shock_vel[0]:.4f}, RL={shock_vel[1]:.4f}, FR={shock_vel[2]:.4f}, FL={shock_vel[3]:.4f}")
         
         current_target_positions = self._target_positions[self.leatherback._ALL_INDICES, self._target_index]
         self._position_error_vector = current_target_positions - self.leatherback.data.root_pos_w[:, :2]
@@ -459,7 +622,8 @@ class LeatherbackEnv(DirectRLEnv):
         if torch.any(torch.isnan(self.target_heading_error)):
             self.target_heading_error = torch.where(torch.isnan(self.target_heading_error), torch.zeros_like(self.target_heading_error), self.target_heading_error)
 
-        # Get Lidar data from RayCaster sensor
+        # Get Lidar data from RayCaster sensor (lazily initialized above)
+        assert self.lidar is not None, "LIDAR should be initialized by lazy init above"
         lidar_data = self.lidar.data.ray_hits_w  # Shape: (num_envs, num_rays, 3) - hit positions
         lidar_distances = torch.norm(lidar_data - self.lidar.data.pos_w.unsqueeze(1), dim=-1)  # Shape: (num_envs, 63)
         
@@ -467,12 +631,12 @@ class LeatherbackEnv(DirectRLEnv):
         # Replace inf with max_distance to avoid numerical issues
         lidar_distances = torch.where(
             torch.isinf(lidar_distances),
-            torch.full_like(lidar_distances, self.cfg.scene.lidar.max_distance),
+            torch.full_like(lidar_distances, self._lidar_max_distance),
             lidar_distances
         )
         
         # Normalize lidar distances to [0, 1] range for better learning
-        lidar_normalized = lidar_distances / self.cfg.scene.lidar.max_distance  # Shape: (num_envs, 63)
+        lidar_normalized = lidar_distances / self._lidar_max_distance  # Shape: (num_envs, 63)
         
         # Store minimum lidar distance for debugging/rewards
         self.lidar_min_distance = torch.min(lidar_distances, dim=1)[0]  # Min distance per environment
@@ -513,24 +677,9 @@ class LeatherbackEnv(DirectRLEnv):
         # Replace any remaining NaN values with zeros to prevent training crash
         # This allows training to continue while we identify the root cause
         if torch.any(obs.isnan()):
-            nan_count = torch.sum(obs.isnan()).item()
             nan_mask = obs.isnan()
-            
-            # Identify which observation components have NaNs
-            if nan_count > 0:
-                print(f"[NaN DEBUG] Step {self.common_step_counter}: {nan_count} NaNs in observations")
-                print(f"  Position error: {torch.sum(nan_mask[:, 0]).item()}")
-                print(f"  Heading cos: {torch.sum(nan_mask[:, 1]).item()}")
-                print(f"  Heading sin: {torch.sum(nan_mask[:, 2]).item()}")
-                print(f"  Vel X: {torch.sum(nan_mask[:, 3]).item()}")
-                print(f"  Vel Y: {torch.sum(nan_mask[:, 4]).item()}")
-                print(f"  Ang vel: {torch.sum(nan_mask[:, 5]).item()}")
-                print(f"  Throttle: {torch.sum(nan_mask[:, 6]).item()}")
-                print(f"  Steering: {torch.sum(nan_mask[:, 7]).item()}")
-                print(f"  Shock pos: {torch.sum(nan_mask[:, 8:12]).item()}")
-                print(f"  Shock vel: {torch.sum(nan_mask[:, 12:16]).item()}")
-                print(f"  Lidar: {torch.sum(nan_mask[:, 16:]).item()}")
-            
+            # Optimized: Simplified NaN debug, avoid multiple .item() calls
+            print(f"[NaN DEBUG] Step {self.common_step_counter}: NaNs detected in observations - replacing with zeros")
             obs = torch.where(nan_mask, torch.zeros_like(obs), obs)
             
             # Original debug code (commented out)
@@ -574,7 +723,7 @@ class LeatherbackEnv(DirectRLEnv):
         
         # Shock detection and recovery rewards (Baja passive suspension)
         shock_events = self._detect_shock_events()
-        R_shock = torch.where(shock_events, torch.tensor(-0.20, device=self.device), torch.tensor(0.0, device=self.device))
+        R_shock = torch.where(shock_events, torch.tensor(self.shock_penalty, device=self.device), torch.tensor(0.0, device=self.device))
         
         # Update shock timers and recovery state
         self.shock_timer = torch.where(shock_events, torch.zeros_like(self.shock_timer), self.shock_timer + self.control_dt)
@@ -582,7 +731,7 @@ class LeatherbackEnv(DirectRLEnv):
         
         # Detect recovery events
         recovery_events = self._detect_recovery()
-        R_recovery = torch.where(recovery_events, torch.tensor(0.10, device=self.device), torch.tensor(0.0, device=self.device))
+        R_recovery = torch.where(recovery_events, torch.tensor(self.recovery_bonus, device=self.device), torch.tensor(0.0, device=self.device))
         
         # Clear recovery flag after bonus awarded
         self.recovering = torch.where(recovery_events, torch.zeros_like(self.recovering, dtype=torch.bool), self.recovering)
@@ -597,11 +746,11 @@ class LeatherbackEnv(DirectRLEnv):
         composite_reward = (
             position_progress_rew * self.position_progress_weight +
             target_heading_rew * self.heading_progress_weight +
-            goal_reached * self.goal_reached_bonus +
+            goal_reached * self.goal_reached_bonus +  # Restored: +15 per waypoint
             R_collision +
             R_proximity +
-            R_shock +
-            R_recovery
+            R_shock +       # Gentle -0.2 penalty for suspension management
+            R_recovery      # Gentle +0.1 bonus for recovery
         )
 
         one_hot_encoded = torch.nn.functional.one_hot(self._target_index.long(), num_classes=self._num_goals)
@@ -614,18 +763,22 @@ class LeatherbackEnv(DirectRLEnv):
         return composite_reward
 
     def _check_obstacle_collisions(self):
-        """Check if the robot has collided with obstacles using velocity-adaptive force thresholds.
+        """Check if the robot has collided with obstacles (walls, objects) - ground excluded.
         
-        This uses a robust approach:
-        - Tracks ALL contacts (ground, walls, objects)
-        - Uses velocity-adaptive thresholds to distinguish normal ground contact from collisions
-        - Chassis: Fixed threshold (should never touch anything)
-        - Wheels: Adaptive threshold increases with speed to accommodate higher ground forces
+        Contact sensors filter out ground (/World/ground) to prevent false positives from:
+        - Rough terrain navigation (potholes, bumps)
+        - Normal ground contact force spikes
         
-        This approach is robust to:
-        - Different obstacle types (walls, cars, debris)
-        - Varying speeds and terrain
-        - Robot weight changes
+        Uses velocity-adaptive force thresholds for reliable detection:
+        - Chassis: Fixed 5N threshold (should never touch anything)
+        - Wheels: Base 100N + 10N per m/s (accounts for speed-dependent forces)
+        
+        This approach detects:
+        - Wall collisions (obstacles like TestObstacle_*)
+        - Object collisions (future: other robots, debris)
+        - Side-swipes and direct impacts
+        
+        Terrain impacts (potholes) are handled separately by shock detection system.
         """
         collision_detected = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         
@@ -678,43 +831,35 @@ class LeatherbackEnv(DirectRLEnv):
         return collision_detected
 
     def _detect_shock_events(self) -> torch.Tensor:
-        """Detect shock events based on vertical acceleration and contact forces.
+        """Detect shock events based on vertical acceleration.
+        
+        Uses vertical acceleration as signal (reliable for all terrain types):
+        - Detects potholes, jumps, rough terrain, landing impacts
+        - Physics-based: measures actual chassis impact
+        - Terrain-agnostic: works regardless of surface type
+        
+        Wall collisions are handled separately by collision detection system.
         
         Returns:
             Boolean tensor indicating which environments experienced a shock this step.
         """
-        # Calculate vertical acceleration from velocity change
+        # Vertical acceleration (5g+) detects potholes, jumps, rough terrain
         current_vertical_vel = self.leatherback.data.root_lin_vel_w[:, 2]
         vertical_accel = torch.abs((current_vertical_vel - self.prev_vertical_vel) / self.control_dt)
+        shock_detected = vertical_accel > self.shock_vertical_accel_threshold
         
-        # Check vertical acceleration threshold (3g)
-        accel_shock = vertical_accel > self.shock_vertical_accel_threshold
-        
-        # Check contact impulse from wheel sensors
-        contact_shock = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
-        
-        wheel_sensors = ['contact_wheel_front_left', 'contact_wheel_front_right', 
-                        'contact_wheel_rear_right', 'contact_wheel_rear_left']
-        
-        if hasattr(self.scene, 'sensors'):
-            for sensor_name in wheel_sensors:
-                if sensor_name in self.scene.sensors:
-                    contact_sensor = self.scene.sensors[sensor_name]
-                    
-                    if hasattr(contact_sensor, 'data') and hasattr(contact_sensor.data, 'net_forces_w'):
-                        forces = contact_sensor.data.net_forces_w
-                        
-                        if forces is not None and not torch.any(torch.isnan(forces)):
-                            # Get force magnitude
-                            force_magnitudes = torch.norm(forces, dim=-1)
-                            max_forces = torch.max(force_magnitudes, dim=1)[0]
-                            
-                            # Detect high impact forces (shock threshold)
-                            sensor_shock = max_forces > self.shock_contact_impulse_threshold
-                            contact_shock = contact_shock | sensor_shock
-        
-        # Shock occurs if either vertical accel OR contact force exceeds threshold
-        return accel_shock | contact_shock
+        return shock_detected
+
+    def _debug_shock_detection(self, shock_events: torch.Tensor):
+        """Temporary debug method to verify shock detection isn't firing constantly."""
+        if not hasattr(self, '_shock_detection_counter'):
+            self._shock_detection_counter = 0
+        self._shock_detection_counter += 1
+
+        if self._shock_detection_counter % 300 == 0:  # Every 5 seconds at 60Hz
+            num_shocks = torch.sum(shock_events).item()
+            if num_shocks > 0:
+                print(f"[SHOCK DEBUG] Shocks in last 5s: {num_shocks} events (vertical accel > 5g) across {self.num_envs} envs")
 
     def _detect_recovery(self) -> torch.Tensor:
         """Detect when robot stabilizes after a shock event.
@@ -1061,7 +1206,7 @@ class LeatherbackEnv(DirectRLEnv):
         
         # 15. Move all 5 walls using BATCHED view updates (critical for 2048+ envs)
         # Process environments in batches to avoid overwhelming USD stage updates
-        batch_size = 128  # Smaller batches for faster, more stable initialization
+        batch_size = 128  # Larger batches for faster initialization (optimized for modern GPUs)
         num_batches = (num_reset + batch_size - 1) // batch_size
         
         for batch_idx in range(num_batches):
@@ -1098,11 +1243,11 @@ class LeatherbackEnv(DirectRLEnv):
                     )
         
         print(f"[TWO-GAP + WALL] Reset {num_reset} environments in {num_batches} batches: 2 gaps + 1 random wall")
-        # Debug first environment
-        if 0 in env_ids_tensor.cpu():
-            print(f"  Env 0 Gap 1 walls: {self._obstacle_positions[0, 0, :].cpu().numpy()}, {self._obstacle_positions[0, 1, :].cpu().numpy()}")
-            print(f"  Env 0 Gap 2 walls: {self._obstacle_positions[0, 2, :].cpu().numpy()}, {self._obstacle_positions[0, 3, :].cpu().numpy()}")
-            print(f"  Env 0 Random wall: {self._obstacle_positions[0, 4, :2].cpu().numpy()}")
+        # Debug first environment - DISABLED FOR PERFORMANCE
+        # if 0 in env_ids_tensor.cpu():
+        #     print(f"  Env 0 Gap 1 walls: {self._obstacle_positions[0, 0, :].cpu().numpy()}, {self._obstacle_positions[0, 1, :].cpu().numpy()}")
+        #     print(f"  Env 0 Gap 2 walls: {self._obstacle_positions[0, 2, :].cpu().numpy()}, {self._obstacle_positions[0, 3, :].cpu().numpy()}")
+        #     print(f"  Env 0 Random wall: {self._obstacle_positions[0, 4, :2].cpu().numpy()}")
 
     def _debug_robot_bodies(self):
         """Debug method to list all rigid bodies (simplified, no PhysX API calls)."""

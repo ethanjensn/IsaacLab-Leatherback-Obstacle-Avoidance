@@ -74,8 +74,8 @@ LEATHERBACK_CFG = ArticulationCfg(
             joint_names_expr=["Shock.*"],
             effort_limit_sim=10000.0,
             velocity_limit_sim=5.0,
-            stiffness=1213.38,  # N/m - Baja passive suspension (f_n=2.5Hz, m=19.67kg MEASURED)
-            damping=46.35,      # N·s/m - Damping ratio ζ=0.3
+            stiffness=5000.0,   # N/m - 4x stiffer (10mm sag), natural freq ~5Hz for stability
+            damping=150.0,      # N·s/m - Critical damping ratio ζ=0.5 for quick settling
         ),
     },
 )
