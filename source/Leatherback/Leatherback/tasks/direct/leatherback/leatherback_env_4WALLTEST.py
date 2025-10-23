@@ -211,7 +211,7 @@ class LeatherbackEnvCfg(DirectRLEnvCfg):
     
     # Two-gap navigation configuration (4 walls total)
     num_obstacles_per_env = 5  # 4 walls for 2 gaps + 1 random wall
-    wall_length = 4.0  # Wall length perpendicular to path (m) - longer to prevent going around
+    wall_length = 6.0  # Wall length perpendicular to path (m) - longer to prevent going around
     wall_depth = 0.25  # Wall thickness along path (m)
     wall_height = 1.75  # Wall height (m)
     gap_size_range = (1.0, 1.4)  # Gap between walls (m) - robot fits with clearance
@@ -929,8 +929,8 @@ class LeatherbackEnv(DirectRLEnv):
     def _is_terrain_contact(self, contact_sensor, sensor_name: str) -> bool:
         """Check if contact sensor is detecting terrain collision (not obstacle collision).
         
-        Since GPU contact filtering doesn't work for terrain meshes, we use programmatic detection.
-        We check if the contact sensor has any contacts and if they're likely terrain-based.
+        Terrain contacts are WHEELS ONLY and typically have many contact points.
+        Wall collisions affect chassis or have fewer, more concentrated contact points.
         
         Args:
             contact_sensor: The contact sensor to check
@@ -940,43 +940,36 @@ class LeatherbackEnv(DirectRLEnv):
             True if contact is likely with terrain (should be ignored)
             False if contact is likely with obstacle (should trigger collision)
         """
+        # Chassis collisions are NEVER terrain - chassis should never touch ground
+        if 'chassis' in sensor_name.lower():
+            return False  # Chassis collision = wall/obstacle collision
+        
+        # Wheel contacts could be terrain or walls - check number of contact points
+        # Terrain typically has MANY contact points (continuous surface)
+        # Walls typically have FEW contact points (edge collision)
         try:
-            # Check if sensor has contact data
-            if not hasattr(contact_sensor, 'data') or contact_sensor.data is None:
-                return False
-            
             contact_data = contact_sensor.data
-            
-            # Check if there are any contacts
             if not hasattr(contact_data, 'net_forces_w') or contact_data.net_forces_w is None:
                 return False
             
             forces = contact_data.net_forces_w
-            
-            # If no forces, no contact
             if forces.shape[1] == 0:
                 return False
             
-            # Check force magnitude - terrain contacts are typically lower force
+            # Count number of contact points with significant force (>10N)
             force_magnitudes = torch.norm(forces, dim=-1)
-            max_force = torch.max(force_magnitudes).item()
+            significant_contacts = torch.sum(force_magnitudes > 10.0, dim=1)
             
-            # Terrain contacts typically have forces in the 100-300N range
-            # Obstacle collisions typically have forces > 500N
-            # Use 400N as threshold to distinguish terrain from obstacles
-            terrain_force_threshold = 400.0
-            
-            if max_force < terrain_force_threshold:
-                # Low force = likely terrain contact
-                return True
+            # Terrain: Many contacts (>5 contact points)
+            # Wall: Few contacts (1-3 contact points)
+            if significant_contacts[0] > 5:  # Env 0 only
+                return True  # Many contacts = terrain
             else:
-                # High force = likely obstacle collision
-                return False
+                return False  # Few contacts = wall
                 
         except Exception as e:
-            # If we can't determine, assume it's NOT terrain (safer for collision detection)
             print(f"[DEBUG] Error checking terrain contact for {sensor_name}: {e}")
-            return False
+            return False  # Default to detecting collision
 
     def _detect_shock_events(self) -> torch.Tensor:
         """Detect shock events based on vertical acceleration.
@@ -1214,7 +1207,7 @@ class LeatherbackEnv(DirectRLEnv):
         print(f"[DEBUG] Created 5 wall templates (2 gaps + 1 random) in env_0")
     
     def _reset_obstacle_positions(self, env_ids: torch.Tensor | Sequence[int]):
-        """Place two walls perpendicular to path between waypoints to create a gap the robot must navigate through."""
+        """TESTING: Place one massive wall at first waypoint to test collision detection."""
         # Type guard assertions
         assert self._obstacle_positions is not None
         assert self._obstacle_sizes is not None
@@ -1232,6 +1225,77 @@ class LeatherbackEnv(DirectRLEnv):
         
         # Reset obstacle positions to zero
         self._obstacle_positions[env_ids_tensor, :, :] = 0.0
+        
+        # TESTING: Create SQUARE BOX around robot spawn - IMPOSSIBLE TO AVOID!
+        # Use all 4 walls to create a box with one small opening
+        for env_offset in range(num_reset):
+            env_id = env_ids_tensor[env_offset]
+            
+            # Get robot spawn position
+            robot_spawn = self.leatherback.data.root_pos_w[env_id, :2]  # World coords
+            
+            # Create 4 walls in a square around spawn (3m x 3m box with OVERLAPPING walls)
+            box_distance = 3.0  # 3 meters from spawn to wall center
+            wall_length = 6.0   # 6 meter walls (longer than box to ensure overlap)
+            
+            # Wall 0: North (front) - BLOCKS FORWARD PATH
+            self._obstacle_positions[env_id, 0, :2] = robot_spawn + torch.tensor([box_distance, 0.0], device=self.device)
+            self._obstacle_positions[env_id, 0, 2] = self.cfg.wall_height / 2.0
+            
+            # Wall 1: South (back)
+            self._obstacle_positions[env_id, 1, :2] = robot_spawn + torch.tensor([-box_distance, 0.0], device=self.device)
+            self._obstacle_positions[env_id, 1, 2] = self.cfg.wall_height / 2.0
+            
+            # Wall 2: East (right)
+            self._obstacle_positions[env_id, 2, :2] = robot_spawn + torch.tensor([0.0, box_distance], device=self.device)
+            self._obstacle_positions[env_id, 2, 2] = self.cfg.wall_height / 2.0
+            
+            # Wall 3: West (left)
+            self._obstacle_positions[env_id, 3, :2] = robot_spawn + torch.tensor([0.0, -box_distance], device=self.device)
+            self._obstacle_positions[env_id, 3, 2] = self.cfg.wall_height / 2.0
+            
+            # Hide wall 4 far away
+            self._obstacle_positions[env_id, 4, :] = torch.tensor([10000.0, 10000.0, 0.0], device=self.device)
+        
+        # Move walls using BATCHED view updates
+        batch_size = 128
+        num_batches = (num_reset + batch_size - 1) // batch_size
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, num_reset)
+            batch_env_ids = env_ids_tensor[start_idx:end_idx]
+            
+            for obs_idx in range(5):
+                if obs_idx < len(self._obstacle_views):
+                    view = self._obstacle_views[obs_idx]
+                    max_env_id = torch.max(batch_env_ids).item()
+                    if view.count <= max_env_id:
+                        print(f"[ERROR] Wall {obs_idx} view has only {view.count} instances but trying to access env {max_env_id}")
+                        continue
+                    
+                    wall_positions = self._obstacle_positions[batch_env_ids, obs_idx, :]
+                    
+                    # Box walls: North/South (0,1) use 90° rotation, East/West (2,3) use 0° rotation
+                    import math
+                    wall_orientations_batch = torch.zeros((len(batch_env_ids), 4), device=self.device, dtype=torch.float32)
+                    if obs_idx in [0, 1]:
+                        # North/South walls: 90 degree rotation (wall runs left-right)
+                        angle = math.pi / 2.0  # 90 degrees
+                        wall_orientations_batch[:, 0] = math.cos(angle / 2.0)  # w
+                        wall_orientations_batch[:, 3] = math.sin(angle / 2.0)  # z
+                    else:
+                        # East/West walls: Identity quaternion (wall runs front-back)
+                        wall_orientations_batch[:, 0] = 1.0  # w = 1
+                    
+                    view.set_world_poses(
+                        wall_positions, 
+                        wall_orientations_batch, 
+                        indices=batch_env_ids
+                    )
+        
+        print(f"[TESTING] Created 3m x 3m SQUARE BOX with 6m OVERLAPPING walls in {num_reset} environments - NO GAPS!")
+        return  # Skip the rest of the original logic
         
         # BATCHED OPERATIONS: Process all environments at once
         

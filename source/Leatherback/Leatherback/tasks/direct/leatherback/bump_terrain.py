@@ -19,11 +19,11 @@ from isaaclab.terrains.height_field.utils import height_field_to_mesh
 class HfSphericalBumpsTerrainCfg(HfTerrainBaseCfg):
     """Configuration for a terrain with random spherical bumps."""
 
-    bump_height_range: tuple[float, float] = (0.15, 0.20)
-    """The minimum and maximum height of the bumps (in m). Default: 15-20cm."""
+    bump_height_range: tuple[float, float] = (0.01, 0.02)
+    """The minimum and maximum height of the bumps (in m). Default: 1-2cm (very subtle)."""
 
-    bump_radius_range: tuple[float, float] = (0.075, 0.125)
-    """The minimum and maximum radius of the bumps (in m). Default: 0.15-0.25m diameter."""
+    bump_radius_range: tuple[float, float] = (0.20, 0.35)
+    """The minimum and maximum radius of the bumps (in m). Default: 40-70cm diameter."""
 
     num_bumps_per_env: int = 100
     """The number of bumps to generate per environment. Default: 100."""
@@ -79,14 +79,14 @@ def spherical_bumps_terrain(difficulty: float, cfg: HfSphericalBumpsTerrainCfg) 
         # Calculate distance from bump center to all points
         distances = np.sqrt((xx - center_x)**2 + (yy - center_y)**2)
 
-        # Create spherical bump using cosine falloff (smooth Gaussian-like shape)
+        # Create spherical bump using smooth Gaussian-like falloff
         # Points within radius get positive height, falloff smoothly to zero
         mask = distances <= radius_pixels
         normalized_dist = np.clip(distances / radius_pixels, 0.0, 1.0)
         
-        # Cosine bump shape: h = h_max * cos^2(pi/2 * d/r)
-        # This creates a smooth spherical cap
-        bump_shape = np.cos(normalized_dist * np.pi / 2) ** 2
+        # Smoother bump shape: h = h_max * (1 - d/r)^6
+        # This creates an extremely flat, smooth bump profile (power 6 falloff)
+        bump_shape = (1.0 - normalized_dist) ** 6
         bump_heights = bump_height_actual * bump_shape * mask
 
         # Add bump to terrain (use max to handle overlapping bumps)
