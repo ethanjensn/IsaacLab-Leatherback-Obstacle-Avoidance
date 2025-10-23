@@ -12,9 +12,36 @@ from isaaclab.sim.spawners.shapes import CuboidCfg
 from isaaclab.utils import configclass
 from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCaster, MultiMeshRayCasterCfg, patterns
 from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from .waypoint import WAYPOINT_CFG
 from .leatherback import LEATHERBACK_CFG
+from .bump_terrain import HfSphericalBumpsTerrainCfg, spherical_bumps_terrain
 from isaaclab.markers import VisualizationMarkers
+
+# Terrain configuration with random spherical bumps
+# Full 40x40m terrain matching env_spacing with subtle bumps for shock detection
+BUMP_TERRAIN_CFG = TerrainGeneratorCfg(
+    size=(40.0, 40.0),  # Full 40x40m coverage matching env_spacing
+    horizontal_scale=1.0,  # 1.0m resolution (40x40 = 1600 vertices per env)
+    vertical_scale=0.01,  # 1cm discretization for smooth bumps
+    num_rows=64,  # 64x64 grid = 4096 sub-terrains
+    num_cols=64,
+    sub_terrains={
+        "bumps": HfSphericalBumpsTerrainCfg(
+            size=(40.0, 40.0),
+            horizontal_scale=1.0,
+            vertical_scale=0.01,
+            bump_height_range=(0.15, 0.20),  # 15-20cm bumps
+            bump_radius_range=(0.075, 0.125),  # 0.15-0.25m diameter (very narrow, steeper)
+            num_bumps_per_env=100,  # Very frequent coverage (~80-120 with randomization)
+            function=spherical_bumps_terrain,
+        ),
+    },
+    difficulty_range=(0.0, 1.0),  # Randomize bump heights per sub-terrain
+    use_cache=False,  # Generate fresh terrain each time
+    curriculum=False,
+)
 
 @configclass
 class LeatherbackSceneCfg(InteractiveSceneCfg):
@@ -129,6 +156,8 @@ class LeatherbackSceneCfg(InteractiveSceneCfg):
     #         # ),
     #     ],
     # )
+    
+    # Terrain removed from scene config - will be added manually to preserve original env spacing
 
 @configclass
 class LeatherbackEnvCfg(DirectRLEnvCfg):
@@ -278,11 +307,11 @@ class LeatherbackEnv(DirectRLEnv):
         stage = omni.usd.get_context().get_stage()
         omni.kit.commands.execute('AddPhysicsSceneCommand', stage=stage, path='/World/PhysicsScene')
         
-        # Create a large ground plane without grid
+        # Create flat ground plane first (visual reference only - no collision)
         spawn_ground_plane(
             prim_path="/World/ground",
             cfg=GroundPlaneCfg(
-                size=(10000.0, 10000.0),  # Large enough for 32K+ envs at 40m spacing (181x181 grid = 7240m + buffer)
+                size=(10000.0, 10000.0),  # Large enough for all environments
                 color=(0.2, 0.2, 0.2),  # Dark gray color
                 physics_material=sim_utils.RigidBodyMaterialCfg(
                     friction_combine_mode="multiply",
@@ -293,6 +322,16 @@ class LeatherbackEnv(DirectRLEnv):
                 ),
             ),
         )
+        
+        # Disable collision on ground plane after spawning (visual reference only)
+        from pxr import UsdPhysics
+        stage = omni.usd.get_context().get_stage()
+        ground_prim = stage.GetPrimAtPath("/World/ground")
+        if ground_prim.IsValid():
+            # Remove collision API to disable physics
+            if ground_prim.HasAPI(UsdPhysics.CollisionAPI):
+                ground_prim.RemoveAPI(UsdPhysics.CollisionAPI)
+            print("[TERRAIN] Ground plane collision disabled - visual reference only")
 
         # Setup rest of the scene
         self.leatherback = Articulation(self.cfg.robot_cfg)
@@ -310,6 +349,49 @@ class LeatherbackEnv(DirectRLEnv):
         # Don't filter collisions - obstacles are per-environment and need to collide with robot
         # self.scene.filter_collisions(global_prim_paths=[])  # Disabled - prevents obstacle collisions
         self.scene.articulations["leatherback"] = self.leatherback
+        
+        # Add bumpy terrain on top of flat ground (preserves original env spacing)
+        from isaaclab.terrains import TerrainImporter
+        terrain_cfg = TerrainImporterCfg(
+            prim_path="/World/ground",
+            terrain_type="generator",
+            terrain_generator=BUMP_TERRAIN_CFG,
+            collision_group=0,  # Match robot's local collision group (0)
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.0,
+                dynamic_friction=1.0,
+                restitution=0.0,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.2, 0.2)),
+            debug_vis=False,
+        )
+        self.terrain = TerrainImporter(terrain_cfg)
+        print(f"[TERRAIN] Added bumpy terrain with collision - ground plane is visual reference only")
+        
+        # Explicitly enable collision on terrain meshes after creation
+        from pxr import UsdPhysics, PhysxSchema
+        stage = omni.usd.get_context().get_stage()
+        
+        # Find all terrain mesh prims and ensure collision is enabled
+        for terrain_path in self.terrain.terrain_prim_paths:
+            mesh_prim = stage.GetPrimAtPath(f"{terrain_path}/mesh")
+            if mesh_prim.IsValid():
+                # Ensure collision is enabled
+                if not mesh_prim.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI.Apply(mesh_prim)
+                
+                # Set mesh collision approximation to "meshSimplification" for terrain
+                collision_api = UsdPhysics.CollisionAPI(mesh_prim)
+                collision_api.GetCollisionEnabledAttr().Set(True)
+                
+                # Use mesh simplification for complex terrain
+                if not mesh_prim.HasAPI(UsdPhysics.MeshCollisionAPI):
+                    UsdPhysics.MeshCollisionAPI.Apply(mesh_prim)
+                
+                mesh_collision_api = UsdPhysics.MeshCollisionAPI(mesh_prim)
+                mesh_collision_api.GetApproximationAttr().Set("meshSimplification")
+        
+        print(f"[TERRAIN] Collision explicitly enabled on {len(self.terrain.terrain_prim_paths)} terrain meshes")
         
         # DEFERRED: Sensor registration commented out - sensors will be created/registered after first reset
         # Register sensors with scene AFTER cloning to ensure proper multi-env initialization
@@ -440,11 +522,11 @@ class LeatherbackEnv(DirectRLEnv):
             ),
             mesh_prim_paths=[
                 MultiMeshRayCasterCfg.RaycastTargetCfg(
-                    target_prim_expr="/World/ground",
+                    target_prim_expr="/World/ground/terrain",  # Bumpy terrain mesh (only collidable surface)
                     track_mesh_transforms=True,
                 ),
                 MultiMeshRayCasterCfg.RaycastTargetCfg(
-                    target_prim_expr=f"{self.scene.env_regex_ns}/TestObstacle_.*",
+                    target_prim_expr=f"{self.scene.env_regex_ns}/TestObstacle_.*",  # Wall obstacles
                     track_mesh_transforms=True,
                 ),
             ],
@@ -737,6 +819,9 @@ class LeatherbackEnv(DirectRLEnv):
         # Clear recovery flag after bonus awarded
         self.recovering = torch.where(recovery_events, torch.zeros_like(self.recovering, dtype=torch.bool), self.recovering)
         
+        # Debug shock detection every step for first environment
+        self._debug_shock_rewards(shock_events, recovery_events, R_shock, R_recovery)
+        
         # Update previous vertical velocity for next step's shock detection
         self.prev_vertical_vel = self.leatherback.data.root_lin_vel_w[:, 2].clone()
         
@@ -853,16 +938,44 @@ class LeatherbackEnv(DirectRLEnv):
         
         return shock_detected
 
-    def _debug_shock_detection(self, shock_events: torch.Tensor):
-        """Temporary debug method to verify shock detection isn't firing constantly."""
-        if not hasattr(self, '_shock_detection_counter'):
-            self._shock_detection_counter = 0
-        self._shock_detection_counter += 1
-
-        if self._shock_detection_counter % 300 == 0:  # Every 5 seconds at 60Hz
-            num_shocks = torch.sum(shock_events).item()
-            if num_shocks > 0:
-                print(f"[SHOCK DEBUG] Shocks in last 5s: {num_shocks} events (vertical accel > 5g) across {self.num_envs} envs")
+    def _debug_shock_rewards(self, shock_events: torch.Tensor, recovery_events: torch.Tensor, 
+                              R_shock: torch.Tensor, R_recovery: torch.Tensor):
+        """Debug shock detection showing vertical acceleration and rewards every step for env 0."""
+        if not hasattr(self, '_shock_debug_counter'):
+            self._shock_debug_counter = 0
+        self._shock_debug_counter += 1
+        
+        # Print every 10 steps (6 times per second at 60Hz) for env 0
+        if self._shock_debug_counter % 10 == 0:
+            env_idx = 0  # Monitor first environment
+            
+            # Calculate vertical acceleration
+            current_vertical_vel = self.leatherback.data.root_lin_vel_w[env_idx, 2]
+            vertical_accel = torch.abs((current_vertical_vel - self.prev_vertical_vel[env_idx]) / self.control_dt)
+            vertical_accel_g = vertical_accel / 9.81  # Convert to g-forces
+            
+            # Get shock/recovery status
+            shock = shock_events[env_idx].item()
+            recovery = recovery_events[env_idx].item()
+            shock_reward = R_shock[env_idx].item()
+            recovery_reward = R_recovery[env_idx].item()
+            
+            # Get robot speed
+            speed = torch.norm(self.leatherback.data.root_lin_vel_b[env_idx, :2]).item()
+            
+            # Color codes for status
+            status = ""
+            if shock:
+                status = "🔴 SHOCK"
+            elif recovery:
+                status = "🟢 RECOVERY"
+            elif self.recovering[env_idx]:
+                status = "🟡 RECOVERING"
+            else:
+                status = "⚪ NORMAL"
+            
+            print(f"[SHOCK] Env 0 | {status} | Accel: {vertical_accel_g:.2f}g (thresh: 5.0g) | "
+                  f"R_shock: {shock_reward:+.2f} | R_recovery: {recovery_reward:+.2f} | Speed: {speed:.2f}m/s")
 
     def _detect_recovery(self) -> torch.Tensor:
         """Detect when robot stabilizes after a shock event.
@@ -1336,4 +1449,3 @@ class LeatherbackEnv(DirectRLEnv):
         #     print(f"[DEBUG] WARNING: Scene has no sensors attribute!")
         # 
         # print(f"[DEBUG] === END CONTACT SENSORS DEBUG ===")
-
