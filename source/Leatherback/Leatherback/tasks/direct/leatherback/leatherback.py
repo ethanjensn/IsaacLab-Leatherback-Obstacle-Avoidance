@@ -12,7 +12,7 @@ from isaaclab.assets import ArticulationCfg
 
 # USD path with proper resolution for cross-platform compatibility
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-USD_PATH = os.path.join(CURRENT_DIR, "custom_assets", "leatherback_shocks.usd")
+USD_PATH = os.path.join(CURRENT_DIR, "custom_assets", "leatherback_grex.usd")
 
 LEATHERBACK_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
@@ -66,9 +66,9 @@ LEATHERBACK_CFG = ArticulationCfg(
         "steering": ImplicitActuatorCfg(
             joint_names_expr=["Knuckle__Upright__Front_Right", "Knuckle__Upright__Front_Left"],
             effort_limit_sim=2000.0,
-            velocity_limit_sim=10.0,
-            stiffness=5000.0,
-            damping=100.0,
+            velocity_limit_sim=3.0,  # Reduced from 10.0 for slower steering response
+            stiffness=800.0,  # Reduced from 5000.0 for smoother, more compliant steering
+            damping=250.0,  # Increased from 100.0 for better damping and reduced oscillations
         ),
         "shocks": ImplicitActuatorCfg(
             joint_names_expr=["Shock.*"],

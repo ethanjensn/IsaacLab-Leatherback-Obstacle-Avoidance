@@ -230,6 +230,8 @@ class LeatherbackEnv(DirectRLEnv):
         self._shock_dof_idx, _ = self.leatherback.find_joints(self.cfg.shock_dof_name)
         self._throttle_state = torch.zeros((self.num_envs,4), device=self.device, dtype=torch.float32)
         self._steering_state = torch.zeros((self.num_envs,2), device=self.device, dtype=torch.float32)
+        self._previous_steering_action = torch.zeros((self.num_envs,2), device=self.device, dtype=torch.float32)
+        self.steering_smoothing_alpha = 0.6  # Smoothing factor: 0.6 = faster response with smooth transitions
         self._goal_reached = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
         self.task_completed = torch.zeros((self.num_envs), device=self.device, dtype=torch.bool)
         self._num_goals = 10
@@ -528,8 +530,12 @@ class LeatherbackEnv(DirectRLEnv):
         self.throttle_action = torch.clamp(self._throttle_action, -throttle_max, throttle_max)
         self._throttle_state = self._throttle_action
         
-        self._steering_action = actions[:, 1].repeat_interleave(2).reshape((-1, 2)) * steering_scale
-        self._steering_action = torch.clamp(self._steering_action, -steering_max, steering_max)
+        # Apply exponential moving average smoothing to steering for realistic response
+        raw_steering_action = actions[:, 1].repeat_interleave(2).reshape((-1, 2)) * steering_scale
+        raw_steering_action = torch.clamp(raw_steering_action, -steering_max, steering_max)
+        self._steering_action = (self.steering_smoothing_alpha * raw_steering_action + 
+                                 (1.0 - self.steering_smoothing_alpha) * self._previous_steering_action)
+        self._previous_steering_action = self._steering_action.clone()
         self._steering_state = self._steering_action
         
         # STAGE 1: Shock control disabled - re-enable for STAGE 2
@@ -935,6 +941,9 @@ class LeatherbackEnv(DirectRLEnv):
         self.recovering[env_ids_tensor] = False
         self.prev_vertical_vel[env_ids_tensor] = 0.0
         
+        # Reset steering smoothing state for fresh start
+        self._previous_steering_action[env_ids_tensor] = 0.0
+        
         # Initialize obstacle views if needed (should already be done in _setup_scene)
         if not hasattr(self, '_prims_initialized'):
             print("[WARNING] Obstacle views not initialized in _setup_scene, initializing now...")
@@ -1174,7 +1183,7 @@ class LeatherbackEnv(DirectRLEnv):
             existing_positions = self._obstacle_positions[env_id, 0:4, :2].clone()
             robot_start = self.leatherback.data.root_pos_w[env_id, :2]
             
-            max_attempts = 20  # Try up to 20 times to find valid position
+            max_attempts = 30  # Try up to 30 times to find valid position
             placed = False
             
             for attempt in range(max_attempts):
@@ -1232,9 +1241,9 @@ class LeatherbackEnv(DirectRLEnv):
                         # Gap walls use calculated orientations
                         wall_orientations_batch = wall_orientations[start_idx:end_idx, obs_idx, :]
                     else:
-                        # Random wall gets random rotation (0-120 degrees)
+                        # Random wall gets random rotation (0-100 degrees)
                         wall_orientations_batch = torch.zeros((len(batch_env_ids), 4), device=self.device, dtype=torch.float32)
-                        random_angles = torch.rand(len(batch_env_ids), device=self.device) * (2 * torch.pi / 3)  # 0 to 120 degrees
+                        random_angles = torch.rand(len(batch_env_ids), device=self.device) * (100.0 * torch.pi / 180.0)  # 0 to 100 degrees
                         half_angles = random_angles / 2.0
                         wall_orientations_batch[:, 0] = torch.cos(half_angles)
                         wall_orientations_batch[:, 3] = torch.sin(half_angles)
