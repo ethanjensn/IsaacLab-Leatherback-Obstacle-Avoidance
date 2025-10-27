@@ -20,21 +20,21 @@ from .bump_terrain import HfSphericalBumpsTerrainCfg, spherical_bumps_terrain
 from isaaclab.markers import VisualizationMarkers
 
 # Terrain configuration with random spherical bumps
-# Optimized 10x10m high-res patches for accurate collision without performance hit
+# Smaller 20x20m high-res patches covering main robot path (env_spacing=40m total)
 BUMP_TERRAIN_CFG = TerrainGeneratorCfg(
-    size=(10.0, 10.0),  # 10x10m patches (4x fewer vertices than 20x20m, still covers robot path)
-    horizontal_scale=0.5,  # 0.5m high resolution (20x20 = 400 vertices per patch vs 1600 before)
+    size=(20.0, 20.0),  # 20x20m patches (covers main path, not full env spacing)
+    horizontal_scale=0.5,  # 0.5m high resolution (40x40 = 1600 vertices per patch)
     vertical_scale=0.01,  # 1cm discretization for smooth bumps
     num_rows=64,  # 64x64 grid = 4096 sub-terrains
     num_cols=64,
     sub_terrains={
         "bumps": HfSphericalBumpsTerrainCfg(
-            size=(10.0, 10.0),  # Match parent size
-            horizontal_scale=0.5,  # Match parent resolution for 100% accurate collision detection
+            size=(20.0, 20.0),  # Match parent size
+            horizontal_scale=0.5,  # Match parent resolution for consistent mesh quality
             vertical_scale=0.01,
-            bump_height_range=(0.03, 0.06),  # 3-6cm bumps (low enough to not high-center, still detectable)
-            bump_radius_range=(1.5, 3.0),  # 3-6m diameter (much wider, gentler slopes)
-            num_bumps_per_env=80,  # Slightly fewer to reduce density
+            bump_height_range=(0.10, 0.15),  # 10-15cm bumps (good height for shock detection)
+            bump_radius_range=(1.0, 2.0),  # 2-4m diameter (wide enough to span multiple vertices for smooth slopes)
+            num_bumps_per_env=100,  # Very frequent coverage (~80-120 with randomization)
             function=spherical_bumps_terrain,
         ),
     },
@@ -211,7 +211,7 @@ class LeatherbackEnvCfg(DirectRLEnvCfg):
     
     # Two-gap navigation configuration (4 walls total)
     num_obstacles_per_env = 5  # 4 walls for 2 gaps + 1 random wall
-    wall_length = 4.0  # Wall length perpendicular to path (m) - longer to prevent going around
+    wall_length = 6.0  # Wall length perpendicular to path (m) - longer to prevent going around
     wall_depth = 0.25  # Wall thickness along path (m)
     wall_height = 1.75  # Wall height (m)
     gap_size_range = (1.0, 1.4)  # Gap between walls (m) - robot fits with clearance
@@ -257,21 +257,8 @@ class LeatherbackEnv(DirectRLEnv):
         self._throttle_dof_idx, _ = self.leatherback.find_joints(self.cfg.throttle_dof_name)
         self._steering_dof_idx, _ = self.leatherback.find_joints(self.cfg.steering_dof_name)
         self._shock_dof_idx, _ = self.leatherback.find_joints(self.cfg.shock_dof_name)
-        
-        # DEBUG: Print actual configured values vs USD defaults
-        print("="*80)
-        print("[CONFIG DEBUG] Checking if Python configs are applied:")
-        print(f"  Init spawn height from cfg: {self.cfg.robot_cfg.init_state.pos}")
-        print(f"  Shock joint indices: {self._shock_dof_idx}")
-        if hasattr(self.leatherback, 'actuators') and 'shocks' in self.leatherback.actuators:
-            shock_actuator = self.leatherback.actuators['shocks']
-            print(f"  Shock actuator stiffness (Python cfg): {shock_actuator.stiffness}")
-            print(f"  Shock actuator damping (Python cfg): {shock_actuator.damping}")
-        print("="*80)
         self._throttle_state = torch.zeros((self.num_envs,4), device=self.device, dtype=torch.float32)
         self._steering_state = torch.zeros((self.num_envs,2), device=self.device, dtype=torch.float32)
-        self._previous_steering_action = torch.zeros((self.num_envs,2), device=self.device, dtype=torch.float32)
-        self.steering_smoothing_alpha = 0.6  # Smoothing factor: 0.6 = faster response with smooth transitions
         self._goal_reached = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
         self.task_completed = torch.zeros((self.num_envs), device=self.device, dtype=torch.bool)
         self._num_goals = 10
@@ -301,7 +288,7 @@ class LeatherbackEnv(DirectRLEnv):
         self.damping_per_wheel = 0.0
         
         # Shock detection and recovery tracking for reward system
-        self.shock_vertical_accel_threshold = 0.3 * 9.81  # 0.3g in m/s² - sensitive for 3-6cm bumps (was 0.5g)
+        self.shock_vertical_accel_threshold = 0.5 * 9.81  # 0.5g in m/s² - sensitive shock detection for smooth driving (was 1g)
         self.recovery_window = 2.0  # seconds
         self.shock_penalty = -0.2  # Gentle penalty - was too strong at -2.0 (caused -800 reward)
         self.recovery_bonus = 0.1  # Gentle bonus - was too strong at 1.0
@@ -313,103 +300,10 @@ class LeatherbackEnv(DirectRLEnv):
         # Shock activity monitoring
         self._shock_debug_counter = 0
 
-    def _apply_joint_drive_api_to_shocks(self, stage):
-        """Apply USD DriveAPI to ALL suspension joints (shocks + linkages).
-        
-        This robot has a complex double-wishbone suspension with many joints:
-        - Main shock joints (spring/damper)
-        - Upper/lower arm joints (suspension linkages)
-        - Shock mounting joints (chassis and arm connections)
-        
-        ALL need DriveAPI or the suspension will be locked up.
-        """
-        from pxr import UsdPhysics
-        
-        # Main shock joints - MODERATE-HIGH stiffness/damping (primary suspension)
-        shock_joint_configs = [
-            ("Shock__Rear_Right", 3200.0, 120.0, "linear"),
-            ("Shock__Rear_Left", 3200.0, 120.0, "linear"),
-            ("Shock__Front_Right", 3200.0, 120.0, "linear"),
-            ("Shock__Front_Left", 3200.0, 120.0, "linear"),
-        ]
-        
-        # Suspension linkage joints - LOW stiffness (hold geometry but allow pivoting)
-        # Using 300 N/m prevents collapse while allowing smooth articulation
-        linkage_joint_patterns = [
-            ("Chassis__Arm_Rear_Lower_Right", 300.0, 5.0, "angular"),
-            ("Chassis__Arm_Rear_Lower_Left", 300.0, 5.0, "angular"),
-            ("Chassis__Arm_Front_Lower_Right", 300.0, 5.0, "angular"),
-            ("Chassis__Arm_Front_Lower_Left", 300.0, 5.0, "angular"),
-            ("Chassis__Arm_Rear_Upper_Right", 300.0, 5.0, "angular"),
-            ("Chassis__Arm_Rear_Upper_Left", 300.0, 5.0, "angular"),
-            ("Chassis__Arm_Front_Upper_Right", 300.0, 5.0, "angular"),
-            ("Chassis__Arm_Front_Upper_Left", 300.0, 5.0, "angular"),
-            ("Shock__Chassis__Rear_Upper_Right", 300.0, 5.0, "angular"),
-            ("Shock__Chassis__Rear_Upper_Left", 300.0, 5.0, "angular"),
-            ("Shock__Chassis__Front_Upper_Left", 300.0, 5.0, "angular"),
-            ("Shock__Chassis__Front_Upper_Right", 300.0, 5.0, "angular"),
-            ("Shock__Arm__Rear_Lower_Right", 300.0, 5.0, "angular"),
-            ("Shock__Arm__Rear_Lower_Left", 300.0, 5.0, "angular"),
-            ("Shock__Arm__Front_Lower_Right", 300.0, 5.0, "angular"),
-            ("Shock__Arm__Front_Lower_Left", 300.0, 5.0, "angular"),
-            ("Upright__Arm__Rear_Lower_Right", 300.0, 5.0, "angular"),
-            ("Upright__Arm__Rear_Lower_Left", 300.0, 5.0, "angular"),
-            ("Upright__Arm__Front_Lower_Right", 300.0, 5.0, "angular"),
-            ("Upright__Arm__Front_Lower_Left", 300.0, 5.0, "angular"),
-            ("Upright__Arm__Rear_Upper_Right", 300.0, 5.0, "angular"),
-            ("Upright__Arm__Rear_Upper_Left", 300.0, 5.0, "angular"),
-            ("Upright__Arm__Front_Upper_Right", 300.0, 5.0, "angular"),
-            ("Upright__Arm__Front_Upper_Left", 300.0, 5.0, "angular"),
-        ]
-        
-        print("[JOINT DRIVE API] Applying USD DriveAPI to ALL suspension joints...")
-        
-        # Configure main shock joints (high stiffness)
-        for joint_name, stiffness, damping, drive_type in shock_joint_configs:
-            joint_path = f"/World/envs/env_0/Robot/Joints/{joint_name}"
-            joint_prim = stage.GetPrimAtPath(joint_path)
-            
-            if not joint_prim.IsValid():
-                print(f"[WARNING] Shock joint not found: {joint_path}")
-                continue
-            
-            # Apply DriveAPI
-            if not joint_prim.HasAPI(UsdPhysics.DriveAPI, drive_type):
-                drive_api = UsdPhysics.DriveAPI.Apply(joint_prim, drive_type)
-            else:
-                drive_api = UsdPhysics.DriveAPI(joint_prim, drive_type)
-            
-            drive_api.CreateTypeAttr("force")
-            drive_api.CreateStiffnessAttr(stiffness)
-            drive_api.CreateDampingAttr(damping)
-            print(f"[JOINT DRIVE API] ✓ Shock: {joint_name} (K={stiffness}, D={damping})")
-        
-        # Configure linkage joints (very low stiffness - free to move)
-        for joint_name, stiffness, damping, drive_type in linkage_joint_patterns:
-            joint_path = f"/World/envs/env_0/Robot/Joints/{joint_name}"
-            joint_prim = stage.GetPrimAtPath(joint_path)
-            
-            if not joint_prim.IsValid():
-                # Optional joints - skip if not found
-                continue
-            
-            # Apply DriveAPI
-            if not joint_prim.HasAPI(UsdPhysics.DriveAPI, drive_type):
-                drive_api = UsdPhysics.DriveAPI.Apply(joint_prim, drive_type)
-            else:
-                drive_api = UsdPhysics.DriveAPI(joint_prim, drive_type)
-            
-            drive_api.CreateTypeAttr("force")
-            drive_api.CreateStiffnessAttr(stiffness)
-            drive_api.CreateDampingAttr(damping)
-        
-        print(f"[JOINT DRIVE API] ✓ Configured {len(shock_joint_configs)} shock joints + {len(linkage_joint_patterns)} linkage joints")
-    
     def _setup_scene(self):
         # Add Physics Scene for Lidar to work (required by Isaac Sim 5.0.0)
         import omni.kit.commands
         import omni
-        from pxr import UsdPhysics, PhysxSchema
         stage = omni.usd.get_context().get_stage()
         omni.kit.commands.execute('AddPhysicsSceneCommand', stage=stage, path='/World/PhysicsScene')
         
@@ -442,10 +336,6 @@ class LeatherbackEnv(DirectRLEnv):
         # Setup rest of the scene
         self.leatherback = Articulation(self.cfg.robot_cfg)
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
-        
-        # CRITICAL: Apply JointDrive API to shock joints so PhysX respects stiffness/damping
-        # Without this API, PhysX ignores all spring/damper settings
-        self._apply_joint_drive_api_to_shocks(stage)
         # DEFERRED: LIDAR creation commented out to speed up initialization
         # self.lidar = MultiMeshRayCaster(self.cfg.scene.lidar)
         self.lidar = None  # Will be created lazily after first reset
@@ -696,11 +586,6 @@ class LeatherbackEnv(DirectRLEnv):
         self.damping_per_wheel = c_per_wheel
         self._suspension_configured = True
         
-        # DEBUG: Check actual simulation values vs configured values
-        actual_stiffness = self.leatherback.data.joint_stiffness[0, self._shock_dof_idx]
-        actual_damping = self.leatherback.data.joint_damping[0, self._shock_dof_idx]
-        actual_pos = self.leatherback.data.root_pos_w[0]
-        
         # Print summary
         print("="*80)
         print("[SUSPENSION] Baja Passive Suspension Configuration")
@@ -711,15 +596,6 @@ class LeatherbackEnv(DirectRLEnv):
         print(f"  Per-wheel damping: {c_per_wheel:.2f} N·s/m")
         print(f"  Total spring stiffness: {k_total:.2f} N/m")
         print(f"  Critical damping per wheel: {c_crit:.2f} N·s/m")
-        print("="*80)
-        print("[DEBUG] Actual values IN SIMULATION (env 0):")
-        print(f"  Robot spawn position: {actual_pos.cpu().numpy()}")
-        print(f"  Shock stiffness in sim: {actual_stiffness.cpu().numpy()} N/m")
-        print(f"  Shock damping in sim: {actual_damping.cpu().numpy()} N·s/m")
-        print(f"  Expected from Python cfg: stiffness=3200.0, damping=120.0")
-        print(f"  Static deflection per wheel: {(total_mass * 9.81 / 4) / actual_stiffness[0].item():.4f}m = {((total_mass * 9.81 / 4) / actual_stiffness[0].item())*1000:.1f}mm")
-        print(f"  Travel remaining after settling: {40 - ((total_mass * 9.81 / 4) / actual_stiffness[0].item())*1000:.1f}mm")
-        print(f"  Chassis raised by: {24.1 - ((total_mass * 9.81 / 4) / actual_stiffness[0].item())*1000:.1f}mm (compared to previous 2000 N/m)")
         print("="*80)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -734,12 +610,8 @@ class LeatherbackEnv(DirectRLEnv):
         self.throttle_action = torch.clamp(self._throttle_action, -throttle_max, throttle_max)
         self._throttle_state = self._throttle_action
         
-        # Apply exponential moving average smoothing to steering for realistic response
-        raw_steering_action = actions[:, 1].repeat_interleave(2).reshape((-1, 2)) * steering_scale
-        raw_steering_action = torch.clamp(raw_steering_action, -steering_max, steering_max)
-        self._steering_action = (self.steering_smoothing_alpha * raw_steering_action + 
-                                 (1.0 - self.steering_smoothing_alpha) * self._previous_steering_action)
-        self._previous_steering_action = self._steering_action.clone()
+        self._steering_action = actions[:, 1].repeat_interleave(2).reshape((-1, 2)) * steering_scale
+        self._steering_action = torch.clamp(self._steering_action, -steering_max, steering_max)
         self._steering_state = self._steering_action
         
         # STAGE 1: Shock control disabled - re-enable for STAGE 2
@@ -1057,68 +929,47 @@ class LeatherbackEnv(DirectRLEnv):
     def _is_terrain_contact(self, contact_sensor, sensor_name: str) -> bool:
         """Check if contact sensor is detecting terrain collision (not obstacle collision).
         
-        Since GPU contact filtering doesn't work for terrain meshes, we check contact body paths.
-        If the contact is with "/World/ground/*" (terrain), ignore it.
-        If the contact is with "TestObstacle_*" (walls), detect it as collision.
+        Terrain contacts are WHEELS ONLY and typically have many contact points.
+        Wall collisions affect chassis or have fewer, more concentrated contact points.
         
         Args:
             contact_sensor: The contact sensor to check
             sensor_name: Name of the sensor for debugging
             
         Returns:
-            True if contact is with terrain (should be ignored)
-            False if contact is with obstacle (should trigger collision)
+            True if contact is likely with terrain (should be ignored)
+            False if contact is likely with obstacle (should trigger collision)
         """
+        # Chassis collisions are NEVER terrain - chassis should never touch ground
+        if 'chassis' in sensor_name.lower():
+            return False  # Chassis collision = wall/obstacle collision
+        
+        # Wheel contacts could be terrain or walls - check number of contact points
+        # Terrain typically has MANY contact points (continuous surface)
+        # Walls typically have FEW contact points (edge collision)
         try:
-            # Check if sensor has contact data
-            if not hasattr(contact_sensor, 'data') or contact_sensor.data is None:
-                return False
-            
             contact_data = contact_sensor.data
-            
-            # Check if there are contact body paths available
-            if hasattr(contact_data, 'body_physx_view') and contact_data.body_physx_view is not None:
-                # Try to get contact prim paths (Isaac Lab 1.0+ API)
-                # This is the proper way but might not be available in all versions
-                pass
-            
-            # Fallback: Check net forces - if no forces, no contact
             if not hasattr(contact_data, 'net_forces_w') or contact_data.net_forces_w is None:
                 return False
             
             forces = contact_data.net_forces_w
-            
-            # If no forces, no contact
             if forces.shape[1] == 0:
                 return False
             
-            # IMPROVED: Higher threshold to distinguish bump impacts from wall collisions
-            # Terrain/bump driving: 100-600N (normal suspension forces)
-            # Wall collisions: 800-2000N+ (sudden impact forces)
+            # Count number of contact points with significant force (>10N)
             force_magnitudes = torch.norm(forces, dim=-1)
-            max_force = torch.max(force_magnitudes).item()
+            significant_contacts = torch.sum(force_magnitudes > 10.0, dim=1)
             
-            # Use 800N threshold to only detect actual wall collisions
-            # This filters out normal terrain driving AND bump impacts
-            wall_collision_threshold = 800.0
-            
-            if max_force < wall_collision_threshold:
-                # Low/medium force = terrain/bump driving (ignore)
-                return True
+            # Terrain: Many contacts (>5 contact points)
+            # Wall: Few contacts (1-3 contact points)
+            if significant_contacts[0] > 5:  # Env 0 only
+                return True  # Many contacts = terrain
             else:
-                # High force = wall collision (detect)
-                # Debug: Print when we detect actual collision
-                if not hasattr(self, '_collision_debug_counter'):
-                    self._collision_debug_counter = 0
-                self._collision_debug_counter += 1
-                if self._collision_debug_counter % 60 == 0:  # Print once per second
-                    print(f"[COLLISION DEBUG] {sensor_name}: Force={max_force:.1f}N > {wall_collision_threshold}N threshold")
-                return False
+                return False  # Few contacts = wall
                 
         except Exception as e:
-            # If we can't determine, assume it's NOT terrain (safer for collision detection)
             print(f"[DEBUG] Error checking terrain contact for {sensor_name}: {e}")
-            return False
+            return False  # Default to detecting collision
 
     def _detect_shock_events(self) -> torch.Tensor:
         """Detect shock events based on vertical acceleration.
@@ -1250,9 +1101,6 @@ class LeatherbackEnv(DirectRLEnv):
         self.recovering[env_ids_tensor] = False
         self.prev_vertical_vel[env_ids_tensor] = 0.0
         
-        # Reset steering smoothing state for fresh start
-        self._previous_steering_action[env_ids_tensor] = 0.0
-        
         # Initialize obstacle views if needed (should already be done in _setup_scene)
         if not hasattr(self, '_prims_initialized'):
             print("[WARNING] Obstacle views not initialized in _setup_scene, initializing now...")
@@ -1359,7 +1207,7 @@ class LeatherbackEnv(DirectRLEnv):
         print(f"[DEBUG] Created 5 wall templates (2 gaps + 1 random) in env_0")
     
     def _reset_obstacle_positions(self, env_ids: torch.Tensor | Sequence[int]):
-        """Place two walls perpendicular to path between waypoints to create a gap the robot must navigate through."""
+        """TESTING: Place one massive wall at first waypoint to test collision detection."""
         # Type guard assertions
         assert self._obstacle_positions is not None
         assert self._obstacle_sizes is not None
@@ -1377,6 +1225,77 @@ class LeatherbackEnv(DirectRLEnv):
         
         # Reset obstacle positions to zero
         self._obstacle_positions[env_ids_tensor, :, :] = 0.0
+        
+        # TESTING: Create SQUARE BOX around robot spawn - IMPOSSIBLE TO AVOID!
+        # Use all 4 walls to create a box with one small opening
+        for env_offset in range(num_reset):
+            env_id = env_ids_tensor[env_offset]
+            
+            # Get robot spawn position
+            robot_spawn = self.leatherback.data.root_pos_w[env_id, :2]  # World coords
+            
+            # Create 4 walls in a square around spawn (3m x 3m box with OVERLAPPING walls)
+            box_distance = 3.0  # 3 meters from spawn to wall center
+            wall_length = 6.0   # 6 meter walls (longer than box to ensure overlap)
+            
+            # Wall 0: North (front) - BLOCKS FORWARD PATH
+            self._obstacle_positions[env_id, 0, :2] = robot_spawn + torch.tensor([box_distance, 0.0], device=self.device)
+            self._obstacle_positions[env_id, 0, 2] = self.cfg.wall_height / 2.0
+            
+            # Wall 1: South (back)
+            self._obstacle_positions[env_id, 1, :2] = robot_spawn + torch.tensor([-box_distance, 0.0], device=self.device)
+            self._obstacle_positions[env_id, 1, 2] = self.cfg.wall_height / 2.0
+            
+            # Wall 2: East (right)
+            self._obstacle_positions[env_id, 2, :2] = robot_spawn + torch.tensor([0.0, box_distance], device=self.device)
+            self._obstacle_positions[env_id, 2, 2] = self.cfg.wall_height / 2.0
+            
+            # Wall 3: West (left)
+            self._obstacle_positions[env_id, 3, :2] = robot_spawn + torch.tensor([0.0, -box_distance], device=self.device)
+            self._obstacle_positions[env_id, 3, 2] = self.cfg.wall_height / 2.0
+            
+            # Hide wall 4 far away
+            self._obstacle_positions[env_id, 4, :] = torch.tensor([10000.0, 10000.0, 0.0], device=self.device)
+        
+        # Move walls using BATCHED view updates
+        batch_size = 128
+        num_batches = (num_reset + batch_size - 1) // batch_size
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, num_reset)
+            batch_env_ids = env_ids_tensor[start_idx:end_idx]
+            
+            for obs_idx in range(5):
+                if obs_idx < len(self._obstacle_views):
+                    view = self._obstacle_views[obs_idx]
+                    max_env_id = torch.max(batch_env_ids).item()
+                    if view.count <= max_env_id:
+                        print(f"[ERROR] Wall {obs_idx} view has only {view.count} instances but trying to access env {max_env_id}")
+                        continue
+                    
+                    wall_positions = self._obstacle_positions[batch_env_ids, obs_idx, :]
+                    
+                    # Box walls: North/South (0,1) use 90° rotation, East/West (2,3) use 0° rotation
+                    import math
+                    wall_orientations_batch = torch.zeros((len(batch_env_ids), 4), device=self.device, dtype=torch.float32)
+                    if obs_idx in [0, 1]:
+                        # North/South walls: 90 degree rotation (wall runs left-right)
+                        angle = math.pi / 2.0  # 90 degrees
+                        wall_orientations_batch[:, 0] = math.cos(angle / 2.0)  # w
+                        wall_orientations_batch[:, 3] = math.sin(angle / 2.0)  # z
+                    else:
+                        # East/West walls: Identity quaternion (wall runs front-back)
+                        wall_orientations_batch[:, 0] = 1.0  # w = 1
+                    
+                    view.set_world_poses(
+                        wall_positions, 
+                        wall_orientations_batch, 
+                        indices=batch_env_ids
+                    )
+        
+        print(f"[TESTING] Created 3m x 3m SQUARE BOX with 6m OVERLAPPING walls in {num_reset} environments - NO GAPS!")
+        return  # Skip the rest of the original logic
         
         # BATCHED OPERATIONS: Process all environments at once
         
@@ -1494,7 +1413,7 @@ class LeatherbackEnv(DirectRLEnv):
             existing_positions = self._obstacle_positions[env_id, 0:4, :2].clone()
             robot_start = self.leatherback.data.root_pos_w[env_id, :2]
             
-            max_attempts = 30  # Try up to 30 times to find valid position
+            max_attempts = 20  # Try up to 20 times to find valid position
             placed = False
             
             for attempt in range(max_attempts):
@@ -1552,9 +1471,9 @@ class LeatherbackEnv(DirectRLEnv):
                         # Gap walls use calculated orientations
                         wall_orientations_batch = wall_orientations[start_idx:end_idx, obs_idx, :]
                     else:
-                        # Random wall gets random rotation (0-100 degrees)
+                        # Random wall gets random rotation (0-120 degrees)
                         wall_orientations_batch = torch.zeros((len(batch_env_ids), 4), device=self.device, dtype=torch.float32)
-                        random_angles = torch.rand(len(batch_env_ids), device=self.device) * (100.0 * torch.pi / 180.0)  # 0 to 100 degrees
+                        random_angles = torch.rand(len(batch_env_ids), device=self.device) * (2 * torch.pi / 3)  # 0 to 120 degrees
                         half_angles = random_angles / 2.0
                         wall_orientations_batch[:, 0] = torch.cos(half_angles)
                         wall_orientations_batch[:, 3] = torch.sin(half_angles)
