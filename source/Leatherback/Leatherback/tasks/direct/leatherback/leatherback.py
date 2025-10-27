@@ -12,6 +12,7 @@ from isaaclab.assets import ArticulationCfg
 
 # USD path with proper resolution for cross-platform compatibility
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Use leatherback_shocks.usd - has JointDrive API for stiffness/damping to work
 USD_PATH = os.path.join(CURRENT_DIR, "custom_assets", "leatherback_shocks.usd")
 
 LEATHERBACK_CFG = ArticulationCfg(
@@ -34,7 +35,7 @@ LEATHERBACK_CFG = ArticulationCfg(
         activate_contact_sensors=True,  # Enable contact sensors on the robot
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.0),  # Increased from 0.05m to 0.25m to prevent initial drop/bounce
+        pos=(0.0, 0.0, 0.12),  # 12cm above ground - shocks start fully extended to maximize chassis height
         joint_pos={
             "Wheel__Knuckle__Front_Left": 0.0,
             "Wheel__Knuckle__Front_Right": 0.0,
@@ -42,10 +43,10 @@ LEATHERBACK_CFG = ArticulationCfg(
             "Wheel__Upright__Rear_Left": 0.0,
             "Knuckle__Upright__Front_Right": 0.0,
             "Knuckle__Upright__Front_Left": 0.0,
-            "Shock__Rear_Right": -0.030,
-            "Shock__Rear_Left": -0.030,
-            "Shock__Front_Right": 0.030,
-            "Shock__Front_Left": 0.030,
+            "Shock__Rear_Right": -0.048,  # Rear: -0.05 to -0.01, start FULLY extended (lifts chassis max)
+            "Shock__Rear_Left": -0.048,   # Negative values = extended, -0.048 is near limit
+            "Shock__Front_Right": 0.048,  # Front: +0.01 to +0.05, start FULLY extended (lifts chassis max)  
+            "Shock__Front_Left": 0.048,   # Positive values = compressed, +0.048 is near limit
         },
     ),
     actuators={
@@ -74,8 +75,8 @@ LEATHERBACK_CFG = ArticulationCfg(
             joint_names_expr=["Shock.*"],
             effort_limit_sim=10000.0,
             velocity_limit_sim=5.0,
-            stiffness=1200.0,   # N/m - Matches calculated Baja suspension (~1213 N/m)
-            damping=46.0,       # N·s/m - Matches calculated damping (~46 N·s/m, ζ=0.3)
+            stiffness=3200.0,   # N/m - Stiffer springs for ~1.5cm deflection (raises chassis ~9mm)
+            damping=120.0,      # N·s/m - Increased damping proportionally
         ),
     },
 )

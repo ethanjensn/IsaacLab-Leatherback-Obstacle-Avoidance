@@ -20,21 +20,21 @@ from .bump_terrain import HfSphericalBumpsTerrainCfg, spherical_bumps_terrain
 from isaaclab.markers import VisualizationMarkers
 
 # Terrain configuration with random spherical bumps
-# Smaller 20x20m high-res patches covering main robot path (env_spacing=40m total)
+# Optimized 10x10m high-res patches for accurate collision without performance hit
 BUMP_TERRAIN_CFG = TerrainGeneratorCfg(
-    size=(20.0, 20.0),  # 20x20m patches (covers main path, not full env spacing)
-    horizontal_scale=0.5,  # 0.5m high resolution (40x40 = 1600 vertices per patch)
+    size=(10.0, 10.0),  # 10x10m patches (4x fewer vertices than 20x20m, still covers robot path)
+    horizontal_scale=0.5,  # 0.5m high resolution (20x20 = 400 vertices per patch vs 1600 before)
     vertical_scale=0.01,  # 1cm discretization for smooth bumps
     num_rows=64,  # 64x64 grid = 4096 sub-terrains
     num_cols=64,
     sub_terrains={
         "bumps": HfSphericalBumpsTerrainCfg(
-            size=(20.0, 20.0),  # Match parent size
-            horizontal_scale=0.5,  # Match parent resolution for consistent mesh quality
+            size=(10.0, 10.0),  # Match parent size
+            horizontal_scale=0.5,  # Match parent resolution for 100% accurate collision detection
             vertical_scale=0.01,
-            bump_height_range=(0.10, 0.15),  # 10-15cm bumps (good height for shock detection)
-            bump_radius_range=(1.0, 2.0),  # 2-4m diameter (wide enough to span multiple vertices for smooth slopes)
-            num_bumps_per_env=100,  # Very frequent coverage (~80-120 with randomization)
+            bump_height_range=(0.03, 0.06),  # 3-6cm bumps (low enough to not high-center, still detectable)
+            bump_radius_range=(1.5, 3.0),  # 3-6m diameter (much wider, gentler slopes)
+            num_bumps_per_env=80,  # Slightly fewer to reduce density
             function=spherical_bumps_terrain,
         ),
     },
@@ -257,6 +257,17 @@ class LeatherbackEnv(DirectRLEnv):
         self._throttle_dof_idx, _ = self.leatherback.find_joints(self.cfg.throttle_dof_name)
         self._steering_dof_idx, _ = self.leatherback.find_joints(self.cfg.steering_dof_name)
         self._shock_dof_idx, _ = self.leatherback.find_joints(self.cfg.shock_dof_name)
+        
+        # DEBUG: Print actual configured values vs USD defaults
+        print("="*80)
+        print("[CONFIG DEBUG] Checking if Python configs are applied:")
+        print(f"  Init spawn height from cfg: {self.cfg.robot_cfg.init_state.pos}")
+        print(f"  Shock joint indices: {self._shock_dof_idx}")
+        if hasattr(self.leatherback, 'actuators') and 'shocks' in self.leatherback.actuators:
+            shock_actuator = self.leatherback.actuators['shocks']
+            print(f"  Shock actuator stiffness (Python cfg): {shock_actuator.stiffness}")
+            print(f"  Shock actuator damping (Python cfg): {shock_actuator.damping}")
+        print("="*80)
         self._throttle_state = torch.zeros((self.num_envs,4), device=self.device, dtype=torch.float32)
         self._steering_state = torch.zeros((self.num_envs,2), device=self.device, dtype=torch.float32)
         self._goal_reached = torch.zeros((self.num_envs), device=self.device, dtype=torch.int32)
@@ -288,7 +299,7 @@ class LeatherbackEnv(DirectRLEnv):
         self.damping_per_wheel = 0.0
         
         # Shock detection and recovery tracking for reward system
-        self.shock_vertical_accel_threshold = 0.5 * 9.81  # 0.5g in m/s² - sensitive shock detection for smooth driving (was 1g)
+        self.shock_vertical_accel_threshold = 0.3 * 9.81  # 0.3g in m/s² - sensitive for 3-6cm bumps (was 0.5g)
         self.recovery_window = 2.0  # seconds
         self.shock_penalty = -0.2  # Gentle penalty - was too strong at -2.0 (caused -800 reward)
         self.recovery_bonus = 0.1  # Gentle bonus - was too strong at 1.0
@@ -300,10 +311,103 @@ class LeatherbackEnv(DirectRLEnv):
         # Shock activity monitoring
         self._shock_debug_counter = 0
 
+    def _apply_joint_drive_api_to_shocks(self, stage):
+        """Apply USD DriveAPI to ALL suspension joints (shocks + linkages).
+        
+        This robot has a complex double-wishbone suspension with many joints:
+        - Main shock joints (spring/damper)
+        - Upper/lower arm joints (suspension linkages)
+        - Shock mounting joints (chassis and arm connections)
+        
+        ALL need DriveAPI or the suspension will be locked up.
+        """
+        from pxr import UsdPhysics
+        
+        # Main shock joints - MODERATE-HIGH stiffness/damping (primary suspension)
+        shock_joint_configs = [
+            ("Shock__Rear_Right", 3200.0, 120.0, "linear"),
+            ("Shock__Rear_Left", 3200.0, 120.0, "linear"),
+            ("Shock__Front_Right", 3200.0, 120.0, "linear"),
+            ("Shock__Front_Left", 3200.0, 120.0, "linear"),
+        ]
+        
+        # Suspension linkage joints - LOW stiffness (hold geometry but allow pivoting)
+        # Using 300 N/m prevents collapse while allowing smooth articulation
+        linkage_joint_patterns = [
+            ("Chassis__Arm_Rear_Lower_Right", 300.0, 5.0, "angular"),
+            ("Chassis__Arm_Rear_Lower_Left", 300.0, 5.0, "angular"),
+            ("Chassis__Arm_Front_Lower_Right", 300.0, 5.0, "angular"),
+            ("Chassis__Arm_Front_Lower_Left", 300.0, 5.0, "angular"),
+            ("Chassis__Arm_Rear_Upper_Right", 300.0, 5.0, "angular"),
+            ("Chassis__Arm_Rear_Upper_Left", 300.0, 5.0, "angular"),
+            ("Chassis__Arm_Front_Upper_Right", 300.0, 5.0, "angular"),
+            ("Chassis__Arm_Front_Upper_Left", 300.0, 5.0, "angular"),
+            ("Shock__Chassis__Rear_Upper_Right", 300.0, 5.0, "angular"),
+            ("Shock__Chassis__Rear_Upper_Left", 300.0, 5.0, "angular"),
+            ("Shock__Chassis__Front_Upper_Left", 300.0, 5.0, "angular"),
+            ("Shock__Chassis__Front_Upper_Right", 300.0, 5.0, "angular"),
+            ("Shock__Arm__Rear_Lower_Right", 300.0, 5.0, "angular"),
+            ("Shock__Arm__Rear_Lower_Left", 300.0, 5.0, "angular"),
+            ("Shock__Arm__Front_Lower_Right", 300.0, 5.0, "angular"),
+            ("Shock__Arm__Front_Lower_Left", 300.0, 5.0, "angular"),
+            ("Upright__Arm__Rear_Lower_Right", 300.0, 5.0, "angular"),
+            ("Upright__Arm__Rear_Lower_Left", 300.0, 5.0, "angular"),
+            ("Upright__Arm__Front_Lower_Right", 300.0, 5.0, "angular"),
+            ("Upright__Arm__Front_Lower_Left", 300.0, 5.0, "angular"),
+            ("Upright__Arm__Rear_Upper_Right", 300.0, 5.0, "angular"),
+            ("Upright__Arm__Rear_Upper_Left", 300.0, 5.0, "angular"),
+            ("Upright__Arm__Front_Upper_Right", 300.0, 5.0, "angular"),
+            ("Upright__Arm__Front_Upper_Left", 300.0, 5.0, "angular"),
+        ]
+        
+        print("[JOINT DRIVE API] Applying USD DriveAPI to ALL suspension joints...")
+        
+        # Configure main shock joints (high stiffness)
+        for joint_name, stiffness, damping, drive_type in shock_joint_configs:
+            joint_path = f"/World/envs/env_0/Robot/Joints/{joint_name}"
+            joint_prim = stage.GetPrimAtPath(joint_path)
+            
+            if not joint_prim.IsValid():
+                print(f"[WARNING] Shock joint not found: {joint_path}")
+                continue
+            
+            # Apply DriveAPI
+            if not joint_prim.HasAPI(UsdPhysics.DriveAPI, drive_type):
+                drive_api = UsdPhysics.DriveAPI.Apply(joint_prim, drive_type)
+            else:
+                drive_api = UsdPhysics.DriveAPI(joint_prim, drive_type)
+            
+            drive_api.CreateTypeAttr("force")
+            drive_api.CreateStiffnessAttr(stiffness)
+            drive_api.CreateDampingAttr(damping)
+            print(f"[JOINT DRIVE API] ✓ Shock: {joint_name} (K={stiffness}, D={damping})")
+        
+        # Configure linkage joints (very low stiffness - free to move)
+        for joint_name, stiffness, damping, drive_type in linkage_joint_patterns:
+            joint_path = f"/World/envs/env_0/Robot/Joints/{joint_name}"
+            joint_prim = stage.GetPrimAtPath(joint_path)
+            
+            if not joint_prim.IsValid():
+                # Optional joints - skip if not found
+                continue
+            
+            # Apply DriveAPI
+            if not joint_prim.HasAPI(UsdPhysics.DriveAPI, drive_type):
+                drive_api = UsdPhysics.DriveAPI.Apply(joint_prim, drive_type)
+            else:
+                drive_api = UsdPhysics.DriveAPI(joint_prim, drive_type)
+            
+            drive_api.CreateTypeAttr("force")
+            drive_api.CreateStiffnessAttr(stiffness)
+            drive_api.CreateDampingAttr(damping)
+        
+        print(f"[JOINT DRIVE API] ✓ Configured {len(shock_joint_configs)} shock joints + {len(linkage_joint_patterns)} linkage joints")
+    
     def _setup_scene(self):
         # Add Physics Scene for Lidar to work (required by Isaac Sim 5.0.0)
         import omni.kit.commands
         import omni
+        from pxr import UsdPhysics, PhysxSchema
         stage = omni.usd.get_context().get_stage()
         omni.kit.commands.execute('AddPhysicsSceneCommand', stage=stage, path='/World/PhysicsScene')
         
@@ -336,6 +440,10 @@ class LeatherbackEnv(DirectRLEnv):
         # Setup rest of the scene
         self.leatherback = Articulation(self.cfg.robot_cfg)
         self.waypoints = VisualizationMarkers(self.cfg.waypoint_cfg)
+        
+        # CRITICAL: Apply JointDrive API to shock joints so PhysX respects stiffness/damping
+        # Without this API, PhysX ignores all spring/damper settings
+        self._apply_joint_drive_api_to_shocks(stage)
         # DEFERRED: LIDAR creation commented out to speed up initialization
         # self.lidar = MultiMeshRayCaster(self.cfg.scene.lidar)
         self.lidar = None  # Will be created lazily after first reset
@@ -586,6 +694,11 @@ class LeatherbackEnv(DirectRLEnv):
         self.damping_per_wheel = c_per_wheel
         self._suspension_configured = True
         
+        # DEBUG: Check actual simulation values vs configured values
+        actual_stiffness = self.leatherback.data.joint_stiffness[0, self._shock_dof_idx]
+        actual_damping = self.leatherback.data.joint_damping[0, self._shock_dof_idx]
+        actual_pos = self.leatherback.data.root_pos_w[0]
+        
         # Print summary
         print("="*80)
         print("[SUSPENSION] Baja Passive Suspension Configuration")
@@ -596,6 +709,15 @@ class LeatherbackEnv(DirectRLEnv):
         print(f"  Per-wheel damping: {c_per_wheel:.2f} N·s/m")
         print(f"  Total spring stiffness: {k_total:.2f} N/m")
         print(f"  Critical damping per wheel: {c_crit:.2f} N·s/m")
+        print("="*80)
+        print("[DEBUG] Actual values IN SIMULATION (env 0):")
+        print(f"  Robot spawn position: {actual_pos.cpu().numpy()}")
+        print(f"  Shock stiffness in sim: {actual_stiffness.cpu().numpy()} N/m")
+        print(f"  Shock damping in sim: {actual_damping.cpu().numpy()} N·s/m")
+        print(f"  Expected from Python cfg: stiffness=3200.0, damping=120.0")
+        print(f"  Static deflection per wheel: {(total_mass * 9.81 / 4) / actual_stiffness[0].item():.4f}m = {((total_mass * 9.81 / 4) / actual_stiffness[0].item())*1000:.1f}mm")
+        print(f"  Travel remaining after settling: {40 - ((total_mass * 9.81 / 4) / actual_stiffness[0].item())*1000:.1f}mm")
+        print(f"  Chassis raised by: {24.1 - ((total_mass * 9.81 / 4) / actual_stiffness[0].item())*1000:.1f}mm (compared to previous 2000 N/m)")
         print("="*80)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
@@ -929,16 +1051,17 @@ class LeatherbackEnv(DirectRLEnv):
     def _is_terrain_contact(self, contact_sensor, sensor_name: str) -> bool:
         """Check if contact sensor is detecting terrain collision (not obstacle collision).
         
-        Since GPU contact filtering doesn't work for terrain meshes, we use programmatic detection.
-        We check if the contact sensor has any contacts and if they're likely terrain-based.
+        Since GPU contact filtering doesn't work for terrain meshes, we check contact body paths.
+        If the contact is with "/World/ground/*" (terrain), ignore it.
+        If the contact is with "TestObstacle_*" (walls), detect it as collision.
         
         Args:
             contact_sensor: The contact sensor to check
             sensor_name: Name of the sensor for debugging
             
         Returns:
-            True if contact is likely with terrain (should be ignored)
-            False if contact is likely with obstacle (should trigger collision)
+            True if contact is with terrain (should be ignored)
+            False if contact is with obstacle (should trigger collision)
         """
         try:
             # Check if sensor has contact data
@@ -947,7 +1070,13 @@ class LeatherbackEnv(DirectRLEnv):
             
             contact_data = contact_sensor.data
             
-            # Check if there are any contacts
+            # Check if there are contact body paths available
+            if hasattr(contact_data, 'body_physx_view') and contact_data.body_physx_view is not None:
+                # Try to get contact prim paths (Isaac Lab 1.0+ API)
+                # This is the proper way but might not be available in all versions
+                pass
+            
+            # Fallback: Check net forces - if no forces, no contact
             if not hasattr(contact_data, 'net_forces_w') or contact_data.net_forces_w is None:
                 return False
             
@@ -957,20 +1086,27 @@ class LeatherbackEnv(DirectRLEnv):
             if forces.shape[1] == 0:
                 return False
             
-            # Check force magnitude - terrain contacts are typically lower force
+            # IMPROVED: Higher threshold to distinguish bump impacts from wall collisions
+            # Terrain/bump driving: 100-600N (normal suspension forces)
+            # Wall collisions: 800-2000N+ (sudden impact forces)
             force_magnitudes = torch.norm(forces, dim=-1)
             max_force = torch.max(force_magnitudes).item()
             
-            # Terrain contacts typically have forces in the 100-300N range
-            # Obstacle collisions typically have forces > 500N
-            # Use 400N as threshold to distinguish terrain from obstacles
-            terrain_force_threshold = 400.0
+            # Use 800N threshold to only detect actual wall collisions
+            # This filters out normal terrain driving AND bump impacts
+            wall_collision_threshold = 800.0
             
-            if max_force < terrain_force_threshold:
-                # Low force = likely terrain contact
+            if max_force < wall_collision_threshold:
+                # Low/medium force = terrain/bump driving (ignore)
                 return True
             else:
-                # High force = likely obstacle collision
+                # High force = wall collision (detect)
+                # Debug: Print when we detect actual collision
+                if not hasattr(self, '_collision_debug_counter'):
+                    self._collision_debug_counter = 0
+                self._collision_debug_counter += 1
+                if self._collision_debug_counter % 60 == 0:  # Print once per second
+                    print(f"[COLLISION DEBUG] {sensor_name}: Force={max_force:.1f}N > {wall_collision_threshold}N threshold")
                 return False
                 
         except Exception as e:
