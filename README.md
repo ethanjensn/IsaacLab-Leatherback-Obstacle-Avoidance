@@ -8,7 +8,11 @@ A reinforcement learning environment for autonomous vehicle navigation using NVI
 - **LiDAR Integration**: Multi-mesh ray casting for obstacle detection
 - **Obstacle Avoidance**: Dynamic collision detection and avoidance
 - **Direct Workflow**: Uses Isaac Lab's direct workflow for efficient simulation
-- **RL Training**: PPO-based training with SKRL library
+- **RL Training**: PPO-based training with RSL-RL library
+
+## Demo
+
+<video src="trained_robot_fast.mp4" controls width="800"></video>
 
 ## Requirements
 
@@ -39,25 +43,52 @@ A reinforcement learning environment for autonomous vehicle navigation using NVI
 
 Train with visualization:
 ```bash
-python scripts/skrl/train.py --task Template-Leatherback-Direct-v0 --num_envs 32
+python scripts/reinforcement_learning/rsl_rl/train.py --task Template-Leatherback-Direct-v0 --num_envs 32
 ```
 
 Train headless (faster):
 ```bash
-python scripts/skrl/train.py --task Template-Leatherback-Direct-v0 --num_envs 4096 --headless
+python scripts/reinforcement_learning/rsl_rl/train.py --task Template-Leatherback-Direct-v0 --num_envs 4096 --headless
 ```
 
 ### Evaluation
 
 Run trained policy:
 ```bash
-python scripts/skrl/play.py --task Template-Leatherback-Direct-v0 --num_envs 32
+python scripts/reinforcement_learning/rsl_rl/play.py --task Template-Leatherback-Direct-v0 --num_envs 32
 ```
 
 With specific checkpoint:
 ```bash
-python scripts/skrl/play.py --task Template-Leatherback-Direct-v0 --checkpoint logs/skrl/leatherback_direct/<RUN_DIR>/checkpoints/agent_<STEP>.pt
+python scripts/reinforcement_learning/rsl_rl/play.py --task Template-Leatherback-Direct-v0 --checkpoint logs/rsl_rl/leatherback_direct/<RUN_DIR>/model_<STEP>.pt
 ```
+
+### Monitoring Training with TensorBoard
+
+RSL-RL automatically logs training metrics to TensorBoard. To monitor training progress:
+
+1. **Start TensorBoard** (in a separate terminal):
+   ```bash
+   tensorboard --logdir=logs/rsl_rl/leatherback_direct
+   ```
+
+2. **View in browser**: Open `http://localhost:6006` (or the URL shown in the terminal)
+
+3. **Key metrics to monitor**:
+   - `train/mean_reward`: Average episode reward (main training progress indicator)
+   - `train/episode_length`: Average episode length
+   - `train/learning_rate`: Current learning rate (if using adaptive schedule)
+   - `train/value_loss`: Value function loss
+   - `train/policy_loss`: Policy gradient loss
+
+4. **Viewing specific run**: To view a specific training run:
+   ```bash
+   tensorboard --logdir=logs/rsl_rl/leatherback_direct/<RUN_DIR>
+   ```
+
+### Training Progress
+
+![train/mean_reward](training_reward.png)
 
 ## Project Structure
 
@@ -68,13 +99,10 @@ Leatherback/
 │   ├── leatherback.py              # Robot configuration
 │   ├── waypoint.py                 # Waypoint markers
 │   ├── agents/
-│   │   └── skrl_ppo_cfg.yaml      # PPO hyperparameters
+│   │   └── rsl_rl_ppo_cfg.py      # PPO hyperparameters
 │   └── custom_assets/
-│       └── leatherback_simple_better.usd
+│       └── leatherback_OG.usd
 ├── scripts/
-│   ├── skrl/
-│   │   ├── train.py               # Training script
-│   │   └── play.py                # Evaluation script
 │   └── list_envs.py               # List available environments
 ├── setup.py                        # Package setup
 └── README.md
@@ -83,80 +111,28 @@ Leatherback/
 ## Environment Details
 
 - **Action Space**: Continuous (throttle, steering)
-- **Observation Space**: Vehicle state, waypoint positions, LiDAR data
+- **Observation Space**: 79 dimensions
+  - 8 base state (position error, heading, velocities, throttle/steering state)
+  - 8 shock proprioception (4 shock positions + 4 shock velocities)
+  - 63 LiDAR ray distances (normalized to [0, 1])
 - **Reward Function**: Distance to waypoints, collision penalties, velocity rewards
-- **Episode Length**: Variable (resets on completion or collision)
+- **Episode Length**: 90 seconds (resets on completion or collision)
+
+## Implicit Learning
+
+The agent learns implicitly from two sensor modalities:
+
+- **LiDAR**: The agent learns to interpret 63 normalized ray distances (360° coverage) to detect and avoid obstacles without explicit obstacle labels.
+
+- **Shocks**: The agent learns to adapt its driving behavior (throttle and steering) based on passive suspension feedback (4 shock positions and 4 shock velocities), learning terrain adaptation and stability control without directly controlling the shocks.
 
 ## Configuration
 
-Edit `agents/skrl_ppo_cfg.yaml` to modify:
-- Network architecture
-- Learning rate
-- Training hyperparameters
-- Rollout settings
-
-## Training History
-
-### [32,32] Layers
-
-- **Phase 1**: 20 second episode, implicit suspension, 10 waypoint, about 20 meters
-    - `2025-09-30_20-51-01_ppo_torch`
-    - REWARD NORMALIZES so 100 is max here
-
-- **Phase 2 (BAD)**: 40 second episode, implicit suspension, 6 waypoints, about 50 meters
-    - `2025-10-01_10-40-21_ppo_torch`
-    - REWARD NORMALIZES so 70 is max here
-
-- **Phase 2a (GOOD/KEPT)**: 40 second episode, implicit suspension, 7 waypoints, 20 meters
-    - `2025-10-01_13-59-46_ppo_torch`
-    - REWARD NORMALIZES so 70 is max here
-
-- ~~**Phase 3**: 40 second episode, 35m, 7 waypoints, implicit suspension~~
-    - ~~`2025-10-01_16-01-45_ppo_torch`~~
-    - ~~REWARD NORMALIZES so 70 is max here~~
-
-- ~~**Phase 3a**: 40 second episode, 35m, 7 waypoints, implicit suspension (New YAML)~~
-    - ~~`2025-10-01_18-32-41_ppo_torch`~~
-    - ~~REWARD NORMALIZES so 70 is max here~~
-    - ~~NEW YAML~~
-
-- **Phase 3b**: 40 second episode, 35m, 10 waypoints, implicit suspension (OG YAML)
-    - `2025-10-01_19-20-50_ppo_torch`
-    - REWARD NORMALIZES so 100 is max here
-    - OG YAML configuration used
-
-- **Phase 3b.1** (continuation of 3b but longer episodes): 80 second episode, 35m, 10 waypoints, implicit suspension
-    - `2025-10-01_20-17-01_ppo_torch`
-    - REWARD NORMALIZES so 100 is max here
-
-### [128,128] Layers
-
-- **Phase 1**: 20 second episode, implicit suspension, 10 waypoint, about 20 meters
-    - `2025-10-01_21-28-34_ppo_torch`
-    - REWARD NORMALIZES so 100 is max here
-
-- **Phase 1a** (64 envs continuation): 20 second episode, implicit suspension, 10 waypoint, about 20 meters
-    - `2025-10-01_22-23-21_ppo_torch`
-    - REWARD NORMALIZES so 100 is max here
-
-- **Phase 2**: 40 second episode, implicit suspension, 7 waypoints, 20 meters
-    - REWARD NORMALIZES so 70 is max here
-
-- **Phase 3**: 80 second episode, 35m, 10 waypoints, implicit suspension
-    - REWARD NORMALIZES so 100 is max here
-
-### [128,128] Layers with Suspension
-
-- **Phase 1**: 20 second episode, 10 waypoint, about 20 meters
-    - `2025-10-01_23-52-12_ppo_torch`
-    - REWARD NORMALIZES so 100 is max here
-
-- **Phase 2**: 40 second episode, 7 waypoints, 20 meters
-    - `2025-10-02_11-12-47_ppo_torch`
-    - REWARD NORMALIZES so 70 is max here
-
-- **Phase 3**: 20 second episode, 10 waypoint, 20 meters, 1D planar LiDAR with 30–60 rays, ±90° FOV, Obstacles: 3–6 randomized per episode, Reset: on collision.
-    - REWARD NORMALIZES so 100 is max here
+Edit `agents/rsl_rl_ppo_cfg.py` to modify:
+- Network architecture (hidden dimensions, activation functions)
+- Learning rate and schedule
+- Training hyperparameters (PPO clip parameter, entropy coefficient, etc.)
+- Rollout settings (steps per environment, mini-batch size)
 
 ## License
 
