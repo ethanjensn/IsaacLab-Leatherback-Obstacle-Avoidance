@@ -86,9 +86,6 @@ RSL-RL automatically logs training metrics to TensorBoard. To monitor training p
    tensorboard --logdir=logs/rsl_rl/leatherback_direct/<RUN_DIR>
    ```
 
-### Training Progress
-
-![train/mean_reward](training_reward.png)
 
 ## Project Structure
 
