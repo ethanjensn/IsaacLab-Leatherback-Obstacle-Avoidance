@@ -10,9 +10,12 @@ A reinforcement learning environment for autonomous vehicle navigation using NVI
 - **Direct Workflow**: Uses Isaac Lab's direct workflow for efficient simulation
 - **RL Training**: PPO-based training with RSL-RL library
 
-## Demo
+## Demo at 2x Speed
 
-<video src="trained_robot_fast.mp4" controls width="800"></video>
+<img src="gif 1 fast.gif" width="400"/>
+<img src="gif 2 fast.gif" width="400"/>
+<img src="gif 3 fast.gif" width="400"/>
+<img src="gif 4 fast.gif" width="400"/>
 
 ## Requirements
 
