@@ -141,3 +141,21 @@ BSD-3-Clause License (consistent with Isaac Lab)
 ## Acknowledgments
 
 Built with NVIDIA Isaac Lab and Isaac Sim simulation platforms.
+
+## Training Phases
+
+- Phase 1.0 (8192 envs):  40 second episode, 10 waypoint,  20 meters, 1D planar LiDAR with 60 rays, 360° Horizontal FOV, Obstacles: 2 gaps 1 random wall per episode, penalty on collision, still continues episode. Reward and penalty for vertical movement for shocks. (FLAT)
+    - +10 waypoint, -10 collision
+    - \rsl_rl\leatherback_direct\2025-10-22_04-25-39\model_4550.pt
+    - 95-100
+- Phase 1.1 (8192 envs):  40 second episode, 10 waypoint,  20 meters, 1D planar LiDAR with 60 rays, 360° Horizontal FOV, Obstacles: 2 gaps 1 random wall per episode, penalty on collision, still continues episode.
+    - 2025-10-28_02-33-13        
+- Phase 2.0 (8192 envs):  40 second episode, 5waypoint,  20 meters, 1D planar LiDAR with 60 rays, 360° Horizontal FOV, Obstacles: 2 gaps 1 random wall per episode, penalty on collision, still continues episode.
+    - Checkpoint: runs/rsl_rl/leatherback_direct/2025-10-28_18-46-10/model_7350.pt (best reward at step 7350, tracked in git)
+    - Final metrics (step 11921):
+      - Mean reward: 103.72
+      - Episode length: 223.83
+      - Value loss: 2.77
+      - Entropy: 14.01
+      - Training FPS: 38,373
+    - 2025-10-28_18-46-10

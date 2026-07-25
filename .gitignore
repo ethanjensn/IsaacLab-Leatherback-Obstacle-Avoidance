@@ -54,9 +54,18 @@ _build
 .lastformat
 
 # RL-Games
-**/runs/*
+# Exception: Allow best checkpoint from Phase 2.0 (must come before ignore)
+!runs/
+!runs/rsl_rl/
+!runs/rsl_rl/leatherback_direct/
+!runs/rsl_rl/leatherback_direct/2025-10-28_18-46-10/
+!runs/rsl_rl/leatherback_direct/2025-10-28_18-46-10/model_7350.pt
+
 **/logs/*
 **/recordings/*
+**/runs/*
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
+
+venv/
